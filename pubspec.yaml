@@ -32,7 +32,7 @@ dependencies:
     sdk: flutter
 
   # 📺 Core LibVLC Media Engine Player 
-  video_player: ^2.9.2
+  fijkplayer: ^1.0.1
 
   # 📥 Asynchronous Data Fetching Client
   http: ^1.2.2
