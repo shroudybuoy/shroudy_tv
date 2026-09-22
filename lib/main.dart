@@ -443,8 +443,17 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
 class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late VlcPlayerController _controller;
   bool _showControls = true;
+  bool _isFullscreen = false;
   String? _errorText;
   VlcVideoFit _currentFit = VlcVideoFit.contain;
+
+  // Active tracked options
+  String _selectedAspectRatio = 'Fit to screen';
+  int? _selectedAudioTrackId;
+  int? _selectedSubtitleTrackId;
+
+  List<VlcTrackDescription> _audioTracks = [];
+  List<VlcTrackDescription> _subtitleTracks = [];
 
   @override
   void initState() {
@@ -470,11 +479,35 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _controller.addListener(_playerListener);
   }
 
-  void _playerListener() {
+    void _playerListener() {
     if (!mounted) return;
     final value = _controller.value;
     if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
       setState(() => _errorText = value.errorMessage);
+    }
+    
+    // Fixed: Removed the invalid getter entirely.
+    // Instead, safely attempt to load tracks whenever the player updates.
+    _loadTracksOnce();
+  }
+
+  Future<void> _loadTracksOnce() async {
+    try {
+      // If tracks are already populated or controller isn't ready yet, skip.
+      if (_audioTracks.isNotEmpty || !_controller.value.isPlaying) return;
+
+      final aud = await _controller.getAudioTracks();
+      final sub = await _controller.getSubtitleTracks();
+      
+      if (mounted && aud.isNotEmpty) {
+        setState(() {
+          _audioTracks = aud;
+          _subtitleTracks = sub;
+        });
+      }
+    } catch (e) {
+      // Safe fallback: catches calls made before native side is fully initialized
+      debugPrint('Media tracks are not ready yet: $e');
     }
   }
 
@@ -485,87 +518,162 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-  Future<void> _togglePlayPause() async {
-    try {
-      if (_controller.value.isPlaying) {
-        await _controller.pause();
-      } else {
-        await _controller.play();
-      }
-      if (mounted) setState(() {});
-    } catch (e) {
-      debugPrint('Playback error: $e');
-    }
+  void _openPlayerSettingsDialog() {
+    String tempAspect = _selectedAspectRatio;
+    int? tempAudio = _selectedAudioTrackId;
+    int? tempSubtitle = _selectedSubtitleTrackId;
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF071B32),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              title: const Row(
+                children: [
+                  Icon(Icons.settings, color: Colors.blueAccent),
+                  SizedBox(width: 8),
+                  Text('Player Settings', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildDropdownRow(
+                    label: 'Aspect Ratio:',
+                    value: tempAspect,
+                    items: ['Fit to screen', '16:9', '4:3'],
+                    onChanged: (val) => setDialogState(() => tempAspect = val!),
+                  ),
+                  const SizedBox(height: 12),
+                  _buildDropdownRow(
+                    label: 'Audio Track:',
+                    value: tempAudio ?? -1,
+                    items: [
+                      const DropdownMenuItem(value: -1, child: Text('Default', style: TextStyle(color: Colors.white))),
+                      ..._audioTracks.map((t) => DropdownMenuItem(value: t.id, child: Text(t.name, style: const TextStyle(color: Colors.white)))),
+                    ],
+                    onChanged: (val) => setDialogState(() => tempAudio = val == -1 ? null : val as int?),
+                    isCustomItems: true,
+                  ),
+                  const SizedBox(height: 12),
+                  _buildDropdownRow(
+                    label: 'Subtitles:',
+                    value: tempSubtitle ?? -1,
+                    items: [
+                      const DropdownMenuItem(value: -1, child: Text('None', style: TextStyle(color: Colors.white))),
+                      ..._subtitleTracks.map((t) => DropdownMenuItem(value: t.id, child: Text(t.name, style: const TextStyle(color: Colors.white)))),
+                    ],
+                    onChanged: (val) => setDialogState(() => tempSubtitle = val == -1 ? null : val as int?),
+                    isCustomItems: true,
+                  ),
+                ],
+              ),
+              actions: [
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blueAccent,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    onPressed: () {
+                      _applySettings(tempAspect, tempAudio, tempSubtitle);
+                      Navigator.pop(context);
+                    },
+                    child: const Text('Apply Save', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
-  void _cycleAspectRatio() {
+    Widget _buildDropdownRow({
+    required String label,
+    required dynamic value,
+    required List<dynamic> items,
+    required ValueChanged<dynamic> onChanged,
+    bool isCustomItems = false,
+  }) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+        Container(
+          // Fixed: Changed EdgeInsets.horizontal(8) to EdgeInsets.symmetric(horizontal: 8)
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            color: const Color(0xFF040F1E),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: Colors.white24),
+          ),
+          width: 140,
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<dynamic>(
+              value: value,
+              dropdownColor: const Color(0xFF040F1E),
+              icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+              onChanged: onChanged,
+              items: isCustomItems
+                  ? items as List<DropdownMenuItem<dynamic>>
+                  : items.map((item) {
+                      return DropdownMenuItem<dynamic>(
+                        value: item,
+                        child: Text(item.toString(), style: const TextStyle(color: Colors.white)),
+                      );
+                    }).toList(),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _applySettings(String aspect, int? audioId, int? subtitleId) {
     setState(() {
-      if (_currentFit == VlcVideoFit.contain) {
+      _selectedAspectRatio = aspect;
+      _selectedAudioTrackId = audioId;
+      _selectedSubtitleTrackId = subtitleId;
+
+      if (_selectedAspectRatio == '16:9') {
         _currentFit = VlcVideoFit.fill;
-      } else if (_currentFit == VlcVideoFit.fill) {
+      } else if (_selectedAspectRatio == '4:3') {
         _currentFit = VlcVideoFit.cover;
       } else {
         _currentFit = VlcVideoFit.contain;
       }
     });
+
+    if (audioId != null) _controller.setAudioTrack(audioId);
+    if (subtitleId != null) _controller.setSubtitleTrack(subtitleId);
   }
 
-      void _showTrackSelectionDialog(
-    String title,
-    List<VlcTrackDescription> tracks,
-    Function(int) onSelected,
-  ) {
-    if (tracks.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('No alternative $title tracks found.')),
-      );
-      return;
+  Future<void> _togglePlayPause() async {
+    if (_controller.value.isPlaying) {
+      await _controller.pause();
+    } else {
+      await _controller.play();
     }
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: ShroudyColors.cardNavyBg,
-        title: Text('Select $title', style: const TextStyle(color: Colors.white)),
-        content: SizedBox(
-          width: 300,
-          child: ListView(
-            shrinkWrap: true,
-            children: tracks.map((track) {
-                            return ListTile(
-                title: Text(
-                  track.name,
-                  style: const TextStyle(color: Colors.white),
-                ),
-                onTap: () {
-                  onSelected(track.id);
-                  Navigator.pop(context);
-                },
-              );
-            }).toList(),
-          ),
-        ),
-      ),
-    );
+    setState(() {});
   }
-
-  Future<void> _changeAudioTrack() async {
-    final tracks = await _controller.getAudioTracks();
-    _showTrackSelectionDialog('Audio Track', tracks, (id) async {
-      await _controller.setAudioTrack(id);
-    });
-  }
-
-  Future<void> _changeSubtitleTrack() async {
-    final tracks = await _controller.getSubtitleTracks();
-    _showTrackSelectionDialog('Subtitle', tracks, (id) async {
-      await _controller.setSubtitleTrack(id);
-    });
-  }
-
-
 
   void _toggleFullscreen() {
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Toggling Player View Mode...')));
+    setState(() {
+      _isFullscreen = !_isFullscreen;
+    });
+    if (_isFullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
   }
 
   @override
@@ -610,20 +718,29 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     const Spacer(),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.75), borderRadius: BorderRadius.circular(12)),
+                      decoration: BoxDecoration(color: Colors.black.withAlpha(190), borderRadius: BorderRadius.circular(12)),
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          IconButton(icon: Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white), onPressed: _togglePlayPause),
-                          IconButton(icon: const Icon(Icons.aspect_ratio, color: Colors.white), tooltip: 'Aspect Ratio', onPressed: _cycleAspectRatio),
-                          IconButton(icon: const Icon(Icons.audiotrack, color: Colors.white), tooltip: 'Audio Track', onPressed: _changeAudioTrack),
-                          IconButton(icon: const Icon(Icons.subtitles, color: Colors.white), tooltip: 'Subtitles', onPressed: _changeSubtitleTrack),
+                          IconButton(
+                            icon: Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                            onPressed: _togglePlayPause,
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.settings, color: Colors.white),
+                            tooltip: 'Player Settings',
+                            onPressed: _openPlayerSettingsDialog,
+                          ),
                           IconButton(
                             icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white),
                             tooltip: 'Favorite',
                             onPressed: widget.onFavToggle,
                           ),
-                          IconButton(icon: const Icon(Icons.fullscreen, color: Colors.white), tooltip: 'Fullscreen', onPressed: _toggleFullscreen),
+                          IconButton(
+                            icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
+                            tooltip: 'Fullscreen',
+                            onPressed: _toggleFullscreen,
+                          ),
                         ],
                       ),
                     ),
