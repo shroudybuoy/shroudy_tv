@@ -4,7 +4,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-latest # Dynamically selects the most stable virtual runner image
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
@@ -12,31 +12,26 @@ jobs:
       - name: Install Flutter Framework
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          channel: 'stable' # Automatically matches environment targets seamlessly
 
       - name: Overwrite Older SDK Constraints
         run: |
-          sed -i '' 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
+          # Upgrades the baseline SDK definitions to match current stable toolchains
+          sed -id 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
 
       - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
-
-      - name: Patch Hidden iOS Code-Signing Profile Rules
-        run: |
-          # Automatically strips out the hard team signature rule inside Xcode parameters
-          sed -i '' 's/DEVELOPMENT_TEAM = "";/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
-          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
 
       - name: Fetch system dependencies
         run: flutter pub get
 
       - name: Compile Lightweight iPad Application Asset Container
-        run: flutter build ios --simulator --no-codesign
+        run: flutter build ios --no-codesign
 
       - name: Zip Bundle into a Standalone Sideloadly Installer Package
         run: |
           mkdir -p Payload
-          cp -r build/ios/iphonesimulator/Runner.app Payload/
+          cp -r build/ios/iphoneos/Runner.app Payload/
           zip -r ShroudyTV.ipa Payload
 
       - name: Output Finished File Download Link
