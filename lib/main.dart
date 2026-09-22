@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_vlc_player/flutter_vlc_player.dart'; // 📺 LibVLC Drivers
+import 'package:flutter_vlc_player/flutter_vlc_player.dart'; // 📺 Added Native LibVLC
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -84,25 +84,24 @@ class _MainDashboardState extends State<MainDashboard> {
 
         for (var line in lines) {
           final trimmed = line.trim();
-          final cleanLine = trimmed.replaceAll('\r', '');
-          if (cleanLine.isEmpty) continue;
+          if (trimmed.isEmpty) continue;
 
-          if (cleanLine.toUpperCase().startsWith('#EXTINF:')) {
-            currentName = _extractAttribute(cleanLine, 'tvg-name');
+          if (trimmed.toUpperCase().startsWith('#EXTINF:')) {
+            currentName = _extractAttribute(trimmed, 'tvg-name');
             if (currentName.isEmpty) {
-              final commaIndex = cleanLine.lastIndexOf(',');
-              if (commaIndex >= 0) currentName = cleanLine.substring(commaIndex + 1).trim();
+              final commaIndex = trimmed.lastIndexOf(',');
+              if (commaIndex >= 0) currentName = trimmed.substring(commaIndex + 1).trim();
             }
-            currentLogo = _extractAttribute(cleanLine, 'logo');
-            currentCategory = _extractAttribute(cleanLine, 'group-title');
+            currentLogo = _extractAttribute(trimmed, 'logo');
+            currentCategory = _extractAttribute(trimmed, 'group-title');
             if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
             categoriesSet.add(currentCategory);
-          } else if (!cleanLine.startsWith('#')) {
-            if (cleanLine.startsWith('http://') || cleanLine.startsWith('https://')) {
+          } else if (!trimmed.startsWith('#')) {
+            if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
               _allChannelsList.add(ChannelItem(
                 name: currentName.isEmpty ? "Unknown Channel" : currentName,
                 logoUrl: currentLogo,
-                streamUrl: cleanLine,
+                streamUrl: trimmed,
                 category: currentCategory,
               ));
               currentName = '';
@@ -126,7 +125,7 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   String _extractAttribute(String line, String attributeName) {
-    final regExp = RegExp('$attributeName\\s*=\\s*"([^"]*)"', caseSensitive: false);
+    final regExp = RegExp('$attributeName\\s*=\\s*"([^"]*)"', case_sensitive: false);
     final match = regExp.firstMatch(line);
     return match?.group(1)?.trim() ?? '';
   }
@@ -144,6 +143,9 @@ class _MainDashboardState extends State<MainDashboard> {
   }
   @override
   Widget build(BuildContext context) {
+    final orientation = MediaQuery.of(context).orientation;
+    final isLandscape = orientation == Orientation.landscape;
+
     if (_isLoading) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
@@ -160,15 +162,16 @@ class _MainDashboardState extends State<MainDashboard> {
     }).toList();
 
     return Scaffold(
-      body: _currentChannel != null
-          ? _buildPremiumSplitPlayerLayoutView(filteredChannels)
-          : _buildStandardBrowsingHubView(filteredChannels),
+      body: isLandscape && _currentChannel != null
+          ? _buildImmersiveLandscapePlayer()
+          : _buildStandardTwoPaneLayout(filteredChannels),
     );
   }
 
-  Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
+  Widget _buildStandardTwoPaneLayout(List<ChannelItem> channels) {
     return Column(
       children: [
+        if (_currentChannel != null) _buildEmbeddedPortraitPlayerView(),
         _buildCategoryAndSearchHeaderRow(),
         Expanded(
           child: GridView.builder(
@@ -181,7 +184,8 @@ class _MainDashboardState extends State<MainDashboard> {
             ),
             itemCount: channels.length,
             itemBuilder: (context, index) {
-              return _buildChannelItemCard(channels[index]);
+              final channel = channels[index];
+              return _buildChannelItemCard(channel);
             },
           ),
         ),
@@ -194,7 +198,7 @@ class _MainDashboardState extends State<MainDashboard> {
         _categoriesList.sublist(1);
 
     return Container(
-      padding: const EdgeInsets.only(top: 40, left: 16, right: 16, bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Column(
         children: [
           SizedBox(
@@ -252,7 +256,7 @@ class _MainDashboardState extends State<MainDashboard> {
                   color: ShroudyColors.innerLogoBg,
                   width: double.infinity,
                   child: Image.network(channel.logoUrl, fit: BoxFit.contain, 
-                    errorBuilder: (_, __, ___) => const Icon(Icons.tv, color: Colors.white)),
+                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
                 ),
               ),
               const SizedBox(height: 6),
@@ -266,146 +270,37 @@ class _MainDashboardState extends State<MainDashboard> {
       ),
     );
   }
-  Widget _buildPremiumSplitPlayerLayoutView(List<ChannelItem> channels) {
-    final relatedChannels = _allChannelsList
-        .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
-        .toList();
 
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(top: 40, left: 24, right: 24, bottom: 12),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Expanded(
-                child: Text(
-                  "NOW PLAYING: ${_currentChannel!.name.toUpperCase()}",
-                  style: const TextStyle(color: ShroudyColors.primaryRed, fontSize: 20, fontWeight: FontWeight.bold),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              const SizedBox(width: 16),
-              ElevatedButton(
-                onPressed: () => setState(() => _currentChannel = null),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: ShroudyColors.cardNavyBg,
-                  side: const BorderSide(color: ShroudyColors.accentBorder, width: 1.5),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                ),
-                child: const Text("← Back", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              )
-            ],
-          ),
-        ),
-        Expanded(
-          flex: 3,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: Container(
-                    color: Colors.black,
-                    child: VideoCanvasPlayerLayer(
-                      key: ValueKey(_currentChannel!.streamUrl),
-                      streamUrl: _currentChannel!.streamUrl,
-                      channelName: _currentChannel!.name,
-                      isFavorited: _favoritesList.contains(_currentChannel!.name),
-                      onFavToggle: () => _toggleFavorite(_currentChannel!.name),
-                      onClose: () => setState(() => _currentChannel = null),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 24),
-                Expanded(
-                  flex: 1,
-                  child: Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: const BoxDecoration(
-                      color: ShroudyColors.cardNavyBg,
-                      border: BorderBorder(color: ShroudyColors.accentBorder, width: 1),
-                    ),
-                    child: const SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text("YOU ARE WATCHING", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 16),
-                          Text("EPG • PROGRAMME GUIDE", style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 6),
-                          Text("NOW • Powered by LibVLC", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                          SizedBox(height: 12),
-                          Text("Hardware stream decoding active with zero layout constraints.", style: TextStyle(color: Colors.grey, fontSize: 12)),
-                        ],
-                      ),
-                    ),
-                  ),
-                )
-              ],
-            ),
-          ),
-        ),
-        const Padding(
-          padding: EdgeInsets.only(left: 24, top: 16, bottom: 8),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text("★ CHANNELS FROM SAME CATEGORY", style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-          ),
-        ),
-        Expanded(
-          flex: 1,
-          child: Padding(
-            padding: const EdgeInsets.only(left: 24, right: 24, bottom: 20),
-            child: relatedChannels.isEmpty
-                ? const Center(child: Text("No related channels in this category", style: TextStyle(color: Colors.grey, fontSize: 12)))
-                : ListView.builder(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: relatedChannels.length,
-                    itemBuilder: (context, idx) {
-                      final relChannel = relatedChannels[idx];
-                      return Container(
-                        width: 140,
-                        margin: const EdgeInsets.only(right: 12),
-                        child: Card(
-                          color: ShroudyColors.cardNavyBg,
-                          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(0))),
-                          child: InkWell(
-                            onTap: () => setState(() => _currentChannel = relChannel),
-                            child: Padding(
-                              padding: const EdgeInsets.all(8.0),
-                              child: Column(
-                                children: [
-                                  Expanded(
-                                    child: Container(
-                                      color: ShroudyColors.innerLogoBg,
-                                      width: double.infinity,
-                                      child: Image.network(relChannel.logoUrl, fit: BoxFit.contain,
-                                          errorBuilder: (_, __, ___) => const Icon(Icons.tv, color: Colors.white)),
-                                    ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(relChannel.name, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
-                                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-        )
-      ],
+  Widget _buildEmbeddedPortraitPlayerView() {
+    return Container(
+      color: Colors.black,
+      width: double.infinity,
+      height: 240,
+      child: VideoCanvasPlayerLayer(
+        key: ValueKey(_currentChannel!.streamUrl),
+        streamUrl: _currentChannel!.streamUrl,
+        channelName: _currentChannel!.name,
+        isFavorited: _favoritesList.contains(_currentChannel!.name),
+        onFavToggle: () => _toggleFavorite(_currentChannel!.name),
+        onClose: () => setState(() => _currentChannel = null),
+      ),
+    );
+  }
+
+  Widget _buildImmersiveLandscapePlayer() {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: VideoCanvasPlayerLayer(
+        key: ValueKey(_currentChannel!.streamUrl),
+        streamUrl: _currentChannel!.streamUrl,
+        channelName: _currentChannel!.name,
+        isFavorited: _favoritesList.contains(_currentChannel!.name),
+        onFavToggle: () => _toggleFavorite(_currentChannel!.name),
+        onClose: () => setState(() => _currentChannel = null),
+      ),
     );
   }
 }
-
 class VideoCanvasPlayerLayer extends StatefulWidget {
   final String streamUrl;
   final String channelName;
@@ -414,7 +309,12 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final VoidCallback onClose;
 
   const VideoCanvasPlayerLayer({
-    super.key, required this.streamUrl, required this.channelName, required this.isFavorited, required this.onFavToggle, required this.onClose
+    super.key, 
+    required this.streamUrl, 
+    required this.channelName, 
+    required this.isFavorited, 
+    required this.onFavToggle, 
+    required this.onClose
   });
 
   @override
@@ -428,16 +328,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void initState() {
     super.initState();
+    // Mount and initialize the raw LibVLC C++ core decoder with network proxies
     _vlcViewController = VlcPlayerController.network(
       widget.streamUrl,
-      hwAcc: HwAcc.full,
+      hwAcc: HwAcc.full, // Active hardware decoding matching Windows client
       options: VlcPlayerOptions(
         advanced: VlcAdvancedOptions([VlcAdvancedOptions.networkCaching(1500)]),
-        http: VlcHttpOptions(['--http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) VLC/3.0.16']),
+        http: VlcHttpOptions(['--http-user-agent=VLC/3.0.16 Mozilla/5.0']),
       ),
       autoPlay: true,
     );
-
+    
     Future.delayed(const Duration(seconds: 4), () {
       if (mounted) setState(() => _showControls = false);
     });
@@ -459,7 +360,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
             child: VlcPlayer(
               controller: _vlcViewController,
               aspectRatio: 16 / 9,
-              placeholder: const Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
+              placeholder: const Center(
+                child: CircularProgressIndicator(color: ShroudyColors.primaryRed),
+              ),
             ),
           ),
           if (_showControls)
@@ -479,27 +382,44 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onClose),
-                        Text(widget.channelName, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                         IconButton(
-                          icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white), 
-                          onPressed: widget.onFavToggle
+                          icon: const Icon(Icons.close, color: Colors.white),
+                          onPressed: widget.onClose,
+                        ),
+                        Text(
+                          widget.channelName,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        IconButton(
+                          icon: Icon(
+                            widget.isFavorited ? Icons.star : Icons.star_border,
+                            color: widget.isFavorited ? ShroudyColors.goldText : Colors.white,
+                          ),
+                          onPressed: widget.onFavToggle,
                         ),
                       ],
                     ),
                     IconButton(
-                      icon: Icon(_vlcViewController.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 48),
+                      icon: Icon(
+                        _vlcViewController.value.isPlaying ? Icons.pause : Icons.play_arrow, 
+                        color: Colors.white, 
+                        size: 48
+                      ),
                       onPressed: () async {
                         if (_vlcViewController.value.isPlaying) {
-await _vlcViewController.pause();
-                          } else {
+                          await _vlcViewController.pause();
+                        } else {
                           await _vlcViewController.play();
-                          }
+                        }
                         setState(() {});
-                        },
+                      },
                     ),
-                    const SizedBox(height: 20)
-                    ],
+                    const SizedBox(height: 20),
+                  ],
                 ),
               ),
             ),
@@ -508,8 +428,3 @@ await _vlcViewController.pause();
     );
   }
 }
-
-class BorderBorder extends Border {
-  const BorderBorder({required BorderSide color, double width = 1.0})
-    : super(top: color, bottom: color, left: color, right: color);
-  }
