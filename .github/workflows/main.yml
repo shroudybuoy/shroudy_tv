@@ -21,9 +21,9 @@ jobs:
       - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
 
-      - name: Inject Native Embedded Rendering Exception Permissions
+      - name: Inject Crucial Apple Security & Video Stream Permissions
         run: |
-          # FIX: Automatically forces native platform flags into Info.plist to unlock video view canvas streams
+          # Automatically injects network access and embedded platform view properties directly into Info.plist
           PLIST_PATH="ios/Runner/Info.plist"
           sed -i '' '/<dict>/a\
           <key>NSAppTransportSecurity</key>\
