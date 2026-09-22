@@ -1,0 +1,34 @@
+name: Build Shroudy TV iPad (.ipa)
+on:
+  workflow_dispatch: # Allows you to trigger the build manually with a single click
+
+jobs:
+  build:
+    runs-on: macos-latest # Remote cloud server environment builds the Apple installer safely
+    steps:
+      - name: Checkout project files
+        uses: actions/checkout@v4
+
+      - name: Install Flutter compiler framework
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+
+      - name: Fetch system dependencies
+        run: flutter pub get
+
+      - name: Compile Lightweight iPad Application Asset Container
+        run: flutter build ios --no-codesign
+
+      - name: Zip Bundle into a Standalone Sideloadly Installer Package
+        run: |
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r ShroudyTV.ipa Payload
+
+      - name: Output Finished File Download Link
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShroudyTV-iPad-Installer
+          path: ShroudyTV.ipa
