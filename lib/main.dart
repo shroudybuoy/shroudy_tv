@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -442,12 +443,12 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
 
 class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late VlcPlayerController _controller;
+
   bool _showControls = true;
   bool _isFullscreen = false;
   String? _errorText;
   VlcVideoFit _currentFit = VlcVideoFit.contain;
 
-  // Active tracked options
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
@@ -455,10 +456,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   List<VlcTrackDescription> _audioTracks = [];
   List<VlcTrackDescription> _subtitleTracks = [];
 
+  Timer? _controlsTimer;
+
   @override
   void initState() {
     super.initState();
     _createController(widget.streamUrl);
+    _scheduleControlsHide();
   }
 
   void _createController(String url) {
@@ -479,43 +483,127 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _controller.addListener(_playerListener);
   }
 
-    void _playerListener() {
+  void _playerListener() {
     if (!mounted) return;
+
     final value = _controller.value;
+
     if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
-      setState(() => _errorText = value.errorMessage);
+      if (_errorText != value.errorMessage) {
+        setState(() => _errorText = value.errorMessage);
+      }
     }
-    
-    // Fixed: Removed the invalid getter entirely.
-    // Instead, safely attempt to load tracks whenever the player updates.
+
+    // Keep the play/pause icon in sync with the native VLC player.
+    if (mounted) setState(() {});
     _loadTracksOnce();
   }
 
   Future<void> _loadTracksOnce() async {
     try {
-      // If tracks are already populated or controller isn't ready yet, skip.
       if (_audioTracks.isNotEmpty || !_controller.value.isPlaying) return;
 
       final aud = await _controller.getAudioTracks();
       final sub = await _controller.getSubtitleTracks();
-      
-      if (mounted && aud.isNotEmpty) {
+
+      if (mounted && (aud.isNotEmpty || sub.isNotEmpty)) {
         setState(() {
           _audioTracks = aud;
           _subtitleTracks = sub;
         });
       }
     } catch (e) {
-      // Safe fallback: catches calls made before native side is fully initialized
       debugPrint('Media tracks are not ready yet: $e');
     }
   }
 
+  void _scheduleControlsHide() {
+    _controlsTimer?.cancel();
+    if (!_showControls) return;
+
+    _controlsTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && !_isFullscreen) {
+        setState(() => _showControls = false);
+      }
+    });
+  }
+
+  void _showControlsTemporarily() {
+    if (!mounted) return;
+    setState(() => _showControls = true);
+    _scheduleControlsHide();
+  }
+
   @override
   void dispose() {
+    _controlsTimer?.cancel();
     _controller.removeListener(_playerListener);
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<void> _togglePlayPause() async {
+    try {
+      if (_controller.value.isPlaying) {
+        await _controller.pause();
+      } else {
+        await _controller.play();
+      }
+      if (mounted) {
+        setState(() {});
+        _showControlsTemporarily();
+      }
+    } catch (e) {
+      debugPrint('Play/pause error: $e');
+    }
+  }
+
+  Future<void> _toggleFullscreen() async {
+    if (_isFullscreen) {
+      Navigator.of(context).pop();
+      return;
+    }
+
+    // Remove this player from the normal layout before putting the SAME
+    // VLC controller into the fullscreen route. This avoids two VlcPlayer
+    // widgets trying to render the same native VLC view at once.
+    setState(() {
+      _isFullscreen = true;
+      _showControls = true;
+    });
+
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
+    if (!mounted) return;
+
+    await Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: true,
+        barrierColor: Colors.black,
+        transitionDuration: const Duration(milliseconds: 150),
+        reverseTransitionDuration: const Duration(milliseconds: 150),
+        pageBuilder: (_, _, _) => _FullscreenVlcView(
+          controller: _controller,
+          channelName: widget.channelName,
+          currentFit: _currentFit,
+          isFavorited: widget.isFavorited,
+          onFavToggle: widget.onFavToggle,
+          onSettings: _openPlayerSettingsDialog,
+          onPlayPause: _togglePlayPause,
+          onExit: () => Navigator.of(context).pop(),
+        ),
+      ),
+    );
+
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+
+    if (mounted) {
+      setState(() {
+        _isFullscreen = false;
+        _showControls = true;
+      });
+      _scheduleControlsHide();
+    }
   }
 
   void _openPlayerSettingsDialog() {
@@ -535,7 +623,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                 children: [
                   Icon(Icons.settings, color: Colors.blueAccent),
                   SizedBox(width: 8),
-                  Text('Player Settings', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  Text('Player Settings',
+                      style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
                 ],
               ),
               content: Column(
@@ -553,10 +642,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     label: 'Audio Track:',
                     value: tempAudio ?? -1,
                     items: [
-                      const DropdownMenuItem(value: -1, child: Text('Default', style: TextStyle(color: Colors.white))),
-                      ..._audioTracks.map((t) => DropdownMenuItem(value: t.id, child: Text(t.name, style: const TextStyle(color: Colors.white)))),
+                      const DropdownMenuItem(
+                        value: -1,
+                        child: Text('Default', style: TextStyle(color: Colors.white)),
+                      ),
+                      ..._audioTracks.map((t) => DropdownMenuItem(
+                            value: t.id,
+                            child: Text(t.name, style: const TextStyle(color: Colors.white)),
+                          )),
                     ],
-                    onChanged: (val) => setDialogState(() => tempAudio = val == -1 ? null : val as int?),
+                    onChanged: (val) =>
+                        setDialogState(() => tempAudio = val == -1 ? null : val as int?),
                     isCustomItems: true,
                   ),
                   const SizedBox(height: 12),
@@ -564,10 +660,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     label: 'Subtitles:',
                     value: tempSubtitle ?? -1,
                     items: [
-                      const DropdownMenuItem(value: -1, child: Text('None', style: TextStyle(color: Colors.white))),
-                      ..._subtitleTracks.map((t) => DropdownMenuItem(value: t.id, child: Text(t.name, style: const TextStyle(color: Colors.white)))),
+                      const DropdownMenuItem(
+                        value: -1,
+                        child: Text('None', style: TextStyle(color: Colors.white)),
+                      ),
+                      ..._subtitleTracks.map((t) => DropdownMenuItem(
+                            value: t.id,
+                            child: Text(t.name, style: const TextStyle(color: Colors.white)),
+                          )),
                     ],
-                    onChanged: (val) => setDialogState(() => tempSubtitle = val == -1 ? null : val as int?),
+                    onChanged: (val) =>
+                        setDialogState(() => tempSubtitle = val == -1 ? null : val as int?),
                     isCustomItems: true,
                   ),
                 ],
@@ -585,7 +688,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       _applySettings(tempAspect, tempAudio, tempSubtitle);
                       Navigator.pop(context);
                     },
-                    child: const Text('Apply Save', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    child: const Text('Apply Save',
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   ),
                 ),
               ],
@@ -596,7 +700,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-    Widget _buildDropdownRow({
+  Widget _buildDropdownRow({
     required String label,
     required dynamic value,
     required List<dynamic> items,
@@ -608,7 +712,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       children: [
         Text(label, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
         Container(
-          // Fixed: Changed EdgeInsets.horizontal(8) to EdgeInsets.symmetric(horizontal: 8)
           padding: const EdgeInsets.symmetric(horizontal: 8),
           decoration: BoxDecoration(
             color: const Color(0xFF040F1E),
@@ -623,7 +726,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
               icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
               onChanged: onChanged,
               items: isCustomItems
-                  ? items as List<DropdownMenuItem<dynamic>>
+                  ? items.cast<DropdownMenuItem<dynamic>>()
                   : items.map((item) {
                       return DropdownMenuItem<dynamic>(
                         value: item,
@@ -643,101 +746,116 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _selectedAudioTrackId = audioId;
       _selectedSubtitleTrackId = subtitleId;
 
-      if (_selectedAspectRatio == '16:9') {
+      if (aspect == '16:9') {
         _currentFit = VlcVideoFit.fill;
-      } else if (_selectedAspectRatio == '4:3') {
+      } else if (aspect == '4:3') {
         _currentFit = VlcVideoFit.cover;
       } else {
         _currentFit = VlcVideoFit.contain;
       }
     });
 
-    if (audioId != null) _controller.setAudioTrack(audioId);
-    if (subtitleId != null) _controller.setSubtitleTrack(subtitleId);
-  }
-
-  Future<void> _togglePlayPause() async {
-    if (_controller.value.isPlaying) {
-      await _controller.pause();
-    } else {
-      await _controller.play();
+    if (audioId != null) {
+      _controller.setAudioTrack(audioId);
     }
-    setState(() {});
-  }
-
-  void _toggleFullscreen() {
-    setState(() {
-      _isFullscreen = !_isFullscreen;
-    });
-    if (_isFullscreen) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    } else {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (subtitleId != null) {
+      _controller.setSubtitleTrack(subtitleId);
     }
+
+    _showControlsTemporarily();
   }
 
   @override
   Widget build(BuildContext context) {
+    // While the fullscreen route owns the native VLC view, leave this
+    // widget empty so the controller is never rendered twice.
+    if (_isFullscreen) {
+      return const ColoredBox(color: Colors.black);
+    }
+
     return GestureDetector(
-      onTap: () => setState(() => _showControls = !_showControls),
+      behavior: HitTestBehavior.opaque,
+      onTap: _showControlsTemporarily,
+      onDoubleTap: _toggleFullscreen,
       child: Stack(
+        fit: StackFit.expand,
         children: [
-          Positioned.fill(
-            child: VlcPlayer(controller: _controller, backgroundColor: Colors.black, fit: _currentFit),
+          VlcPlayer(
+            controller: _controller,
+            backgroundColor: Colors.black,
+            fit: _currentFit,
           ),
+
           if (_errorText != null)
             Positioned.fill(
               child: Container(
                 color: Colors.black54,
                 alignment: Alignment.center,
                 padding: const EdgeInsets.all(24),
-                child: Text('VLC playback error:\n$_errorText', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
+                child: Text(
+                  'VLC playback error:\n$_errorText',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white),
+                ),
               ),
             ),
+
           if (_showControls)
             Positioned.fill(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
+              child: IgnorePointer(
+                ignoring: false,
                 child: Column(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            widget.channelName,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, shadows: [Shadow(blurRadius: 4.0, color: Colors.black)]),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                    // Transparent top area. The channel title is shown without
+                    // a black panel behind it.
+                    SafeArea(
+                      bottom: false,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                        child: Text(
+                          widget.channelName,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            shadows: [
+                              Shadow(blurRadius: 5, color: Colors.black),
+                              Shadow(blurRadius: 10, color: Colors.black),
+                            ],
                           ),
                         ),
-                      ],
+                      ),
                     ),
                     const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(color: Colors.black.withAlpha(190), borderRadius: BorderRadius.circular(12)),
+
+                    // NO BLACK CONTROL PANEL: only the buttons are visible.
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 16),
                       child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          IconButton(
-                            icon: Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                          _playerIconButton(
+                            icon: _controller.value.isPlaying ? Icons.pause : Icons.play_arrow,
+                            tooltip: _controller.value.isPlaying ? 'Pause' : 'Play',
                             onPressed: _togglePlayPause,
                           ),
-                          IconButton(
-                            icon: const Icon(Icons.settings, color: Colors.white),
+                          _playerIconButton(
+                            icon: Icons.settings,
                             tooltip: 'Player Settings',
                             onPressed: _openPlayerSettingsDialog,
                           ),
-                          IconButton(
-                            icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white),
+                          _playerIconButton(
+                            icon: widget.isFavorited ? Icons.star : Icons.star_border,
                             tooltip: 'Favorite',
+                            iconColor:
+                                widget.isFavorited ? ShroudyColors.goldText : Colors.white,
                             onPressed: widget.onFavToggle,
                           ),
-                          IconButton(
-                            icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
+                          _playerIconButton(
+                            icon: _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
                             tooltip: 'Fullscreen',
                             onPressed: _toggleFullscreen,
                           ),
@@ -749,6 +867,221 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
               ),
             ),
         ],
+      ),
+    );
+  }
+
+  Widget _playerIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+    Color iconColor = Colors.white,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: () {
+            _showControlsTemporarily();
+            onPressed();
+          },
+          child: Tooltip(
+            message: tooltip,
+            child: Container(
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(
+                color: Colors.black.withAlpha(120),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: iconColor, size: 25),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Fullscreen owner of the existing VLC controller.
+/// It automatically hides controls after a few seconds and shows them
+/// whenever the video area is touched.
+class _FullscreenVlcView extends StatefulWidget {
+  final VlcPlayerController controller;
+  final String channelName;
+  final VlcVideoFit currentFit;
+  final bool isFavorited;
+  final VoidCallback onFavToggle;
+  final VoidCallback onSettings;
+  final VoidCallback onPlayPause;
+  final VoidCallback onExit;
+
+  const _FullscreenVlcView({
+    required this.controller,
+    required this.channelName,
+    required this.currentFit,
+    required this.isFavorited,
+    required this.onFavToggle,
+    required this.onSettings,
+    required this.onPlayPause,
+    required this.onExit,
+  });
+
+  @override
+  State<_FullscreenVlcView> createState() => _FullscreenVlcViewState();
+}
+
+class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
+  bool _showControls = true;
+  Timer? _hideTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleHide();
+  }
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _showControls = false);
+    });
+  }
+
+  void _touchVideo() {
+    if (!mounted) return;
+    setState(() => _showControls = true);
+    _scheduleHide();
+  }
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _touchVideo,
+        onDoubleTap: _touchVideo,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            VlcPlayer(
+              controller: widget.controller,
+              backgroundColor: Colors.black,
+              fit: widget.currentFit,
+            ),
+
+            if (_showControls)
+              Positioned.fill(
+                child: Column(
+                  children: [
+                    SafeArea(
+                      bottom: false,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                        child: Text(
+                          widget.channelName,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                            shadows: [
+                              Shadow(blurRadius: 5, color: Colors.black),
+                              Shadow(blurRadius: 10, color: Colors.black),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 18),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          _fullIconButton(
+                            icon: widget.controller.value.isPlaying
+                                ? Icons.pause
+                                : Icons.play_arrow,
+                            tooltip:
+                                widget.controller.value.isPlaying ? 'Pause' : 'Play',
+                            onPressed: () {
+                              _touchVideo();
+                              widget.onPlayPause();
+                            },
+                          ),
+                          _fullIconButton(
+                            icon: Icons.settings,
+                            tooltip: 'Player Settings',
+                            onPressed: () {
+                              _touchVideo();
+                              widget.onSettings();
+                            },
+                          ),
+                          _fullIconButton(
+                            icon: widget.isFavorited ? Icons.star : Icons.star_border,
+                            tooltip: 'Favorite',
+                            iconColor:
+                                widget.isFavorited ? ShroudyColors.goldText : Colors.white,
+                            onPressed: () {
+                              _touchVideo();
+                              widget.onFavToggle();
+                            },
+                          ),
+                          _fullIconButton(
+                            icon: Icons.fullscreen_exit,
+                            tooltip: 'Exit Fullscreen',
+                            onPressed: widget.onExit,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _fullIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+    Color iconColor = Colors.white,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onPressed,
+          child: Tooltip(
+            message: tooltip,
+            child: Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: Colors.black.withAlpha(125),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: iconColor, size: 27),
+            ),
+          ),
+        ),
       ),
     );
   }
