@@ -21,9 +21,21 @@ jobs:
       - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
 
+      - name: Inject Native Embedded Rendering Exception Permissions
+        run: |
+          # FIX: Automatically forces native platform flags into Info.plist to unlock video view canvas streams
+          PLIST_PATH="ios/Runner/Info.plist"
+          sed -i '' '/<dict>/a\
+          <key>NSAppTransportSecurity</key>\
+          <dict>\
+              <key>NSAllowsArbitraryLoads</key>\
+              <true/>\
+          </dict>\
+          <key>io.flutter.embedded_views_preview</key>\
+          <true/>' "$PLIST_PATH"
+
       - name: Patch Hidden iOS Code-Signing Profile Rules
         run: |
-          # FIX: Automatically strips out the development team requirement and unlocks unsigned release builds
           sed -i '' 's/DEVELOPMENT_TEAM = "";/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
           sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
 
