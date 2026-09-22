@@ -442,6 +442,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       options: VlcPlayerOptions(
         advanced: VlcAdvancedOptions([VlcAdvancedOptions.networkCaching(1500)]),
         http: VlcHttpOptions(['--http-user-agent=VLC/3.0.16 Mozilla/5.0']),
+        // Enforces texture-backed digital paint display pipelines
+        video: VlcVideoOptions(['--vout=ios']),
       ),
       autoPlay: true,
     );
