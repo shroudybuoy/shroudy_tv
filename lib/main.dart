@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -381,34 +382,46 @@ class _MainDashboardState extends State<MainDashboard> {
             padding: const EdgeInsets.only(left: 24, right: 24, bottom: 20),
             child: relatedChannels.isEmpty
                 ? const Center(child: Text('No related channels in this category', style: TextStyle(color: Colors.grey, fontSize: 12)))
-                : ListView.builder(
-                    scrollDirection: Axis.horizontal,
+                : GridView.builder(
+                    padding: const EdgeInsets.only(right: 0),
+                    gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                      maxCrossAxisExtent: 180,
+                      mainAxisSpacing: 12,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 1.15,
+                    ),
                     itemCount: relatedChannels.length,
                     itemBuilder: (context, idx) {
                       final relChannel = relatedChannels[idx];
-                      return Container(
-                        width: 140,
-                        margin: const EdgeInsets.only(right: 12),
-                        child: Card(
-                          color: ShroudyColors.cardNavyBg,
-                          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
-                          child: InkWell(
-                            onTap: () => setState(() => _currentChannel = relChannel),
-                            child: Padding(
-                              padding: const EdgeInsets.all(8),
-                              child: Column(
-                                children: [
-                                  Expanded(
-                                    child: Container(
-                                      color: ShroudyColors.innerLogoBg,
-                                      width: double.infinity,
-                                      child: Image.network(relChannel.logoUrl, fit: BoxFit.contain, errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
+                      return Card(
+                        color: ShroudyColors.cardNavyBg,
+                        margin: EdgeInsets.zero,
+                        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                        child: InkWell(
+                          onTap: () => setState(() => _currentChannel = relChannel),
+                          child: Padding(
+                            padding: const EdgeInsets.all(8),
+                            child: Column(
+                              children: [
+                                Expanded(
+                                  child: Container(
+                                    color: ShroudyColors.innerLogoBg,
+                                    width: double.infinity,
+                                    child: Image.network(
+                                      relChannel.logoUrl,
+                                      fit: BoxFit.contain,
+                                      errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
                                     ),
                                   ),
-                                  const SizedBox(height: 4),
-                                  Text(relChannel.name, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                ],
-                              ),
+                                ),
+                                const SizedBox(height: 5),
+                                Text(
+                                  relChannel.name,
+                                  style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
                             ),
                           ),
                         ),
@@ -462,11 +475,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   // This notifier lets the fullscreen route immediately receive aspect-ratio
   // changes made in the settings dialog.
   late final ValueNotifier<VlcVideoFit> _fitNotifier;
+  late final ValueNotifier<String> _aspectNotifier;
 
   @override
   void initState() {
     super.initState();
     _fitNotifier = ValueNotifier<VlcVideoFit>(_currentFit);
+    _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
     _createController(widget.streamUrl);
     _showControlsTemporarily();
   }
@@ -512,23 +527,33 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _loadTracksOnce();
   }
 
+  bool _tracksLoaded = false;
+
   Future<void> _loadTracksOnce() async {
+    if (_tracksLoaded) return;
+
     try {
-      if ((_audioTracks.isNotEmpty && _subtitleTracks.isNotEmpty) ||
-          !_controller.value.isPlaying) {
-        return;
-      }
+      // Native VLC can expose tracks a little after playback starts. Retry a few
+      // times instead of permanently leaving the settings dialog empty.
+      for (int attempt = 0; attempt < 5 && mounted; attempt++) {
+        try {
+          final aud = await _controller.getAudioTracks();
+          final sub = await _controller.getSubtitleTracks();
 
-      final aud = await _controller.getAudioTracks();
-      final sub = await _controller.getSubtitleTracks();
-
-      if (!mounted) return;
-
-      if (aud.isNotEmpty || sub.isNotEmpty) {
-        setState(() {
-          _audioTracks = aud;
-          _subtitleTracks = sub;
-        });
+          if (aud.isNotEmpty || sub.isNotEmpty) {
+            _tracksLoaded = true;
+            if (mounted) {
+              setState(() {
+                _audioTracks = aud;
+                _subtitleTracks = sub;
+              });
+            }
+            return;
+          }
+        } catch (e) {
+          debugPrint('Track query attempt ${attempt + 1}: $e');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 500));
       }
     } catch (e) {
       debugPrint('Media tracks are not ready yet: $e');
@@ -551,19 +576,27 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   Future<void> _togglePlayPause() async {
-    // Keep controls visible while the command is being processed.
     _showControlsTemporarily();
 
     try {
-      if (_isPlaying || _controller.value.isPlaying) {
+      // Always read the native VLC state immediately before issuing the command.
+      final currentlyPlaying = _controller.value.isPlaying;
+
+      if (currentlyPlaying) {
         await _controller.pause();
-        _isPlaying = false;
       } else {
         await _controller.play();
-        _isPlaying = true;
       }
 
-      if (mounted) setState(() {});
+      // Give the native VLC side a moment to publish the new state.
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      if (!mounted) return;
+
+      final newState = _controller.value.isPlaying;
+      setState(() {
+        _isPlaying = newState;
+      });
+      _playingNotifier.value = newState;
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
     }
@@ -577,6 +610,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       return;
     }
 
+    final wasPlayingBeforeFullscreen = _controller.value.isPlaying;
     setState(() => _isFullscreen = true);
 
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -589,11 +623,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         barrierColor: Colors.black,
         transitionDuration: Duration.zero,
         reverseTransitionDuration: Duration.zero,
-        // ignore: unnecessary_underscores
         pageBuilder: (_, __, ___) => _FullscreenVlcView(
           controller: _controller,
           channelName: widget.channelName,
           fitNotifier: _fitNotifier,
+          aspectNotifier: _aspectNotifier,
           isPlayingNotifier: _playingNotifier,
           isFavorited: widget.isFavorited,
           onFavToggle: widget.onFavToggle,
@@ -615,14 +649,15 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     setState(() => _isFullscreen = false);
 
     try {
-      if (_controller.value.isPlaying) {
-        _isPlaying = true;
-      } else {
+      // Preserve the state from before fullscreen. Do not unexpectedly start a
+      // stream that the user had paused.
+      if (wasPlayingBeforeFullscreen && !_controller.value.isPlaying) {
         await _controller.play();
-        _isPlaying = true;
       }
+      _isPlaying = _controller.value.isPlaying;
+      _playingNotifier.value = _isPlaying;
     } catch (e) {
-      debugPrint('Could not resume VLC after fullscreen: $e');
+      debugPrint('Could not restore VLC after fullscreen: $e');
     }
 
     _showControlsTemporarily();
@@ -634,7 +669,10 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _playingNotifier.value = _isPlaying;
   }
 
-  void _openPlayerSettingsDialog() {
+  Future<void> _openPlayerSettingsDialog() async {
+    await _loadTracksOnce();
+    if (!mounted) return;
+
     String tempAspect = _selectedAspectRatio;
     int? tempAudio = _selectedAudioTrackId;
     int? tempSubtitle = _selectedSubtitleTrackId;
@@ -719,9 +757,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
-                    onPressed: () {
-                      _applySettings(tempAspect, tempAudio, tempSubtitle);
-                      Navigator.of(dialogContext).pop();
+                    onPressed: () async {
+                      await _applySettings(tempAspect, tempAudio, tempSubtitle);
+                      if (dialogContext.mounted) {
+                        Navigator.of(dialogContext).pop();
+                      }
                     },
                     child: const Text(
                       'Apply & Save',
@@ -784,7 +824,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-  void _applySettings(String aspect, int? audioId, int? subtitleId) {
+  Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     VlcVideoFit newFit;
 
     switch (aspect) {
@@ -798,23 +838,28 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         newFit = VlcVideoFit.contain;
     }
 
-    setState(() {
-      _selectedAspectRatio = aspect;
-      _selectedAudioTrackId = audioId;
-      _selectedSubtitleTrackId = subtitleId;
-      _currentFit = newFit;
-    });
-
-    // Important: update the notifier too, because fullscreen has its own
-    // widget tree and otherwise it keeps the old fit value.
+    if (mounted) {
+      setState(() {
+        _selectedAspectRatio = aspect;
+        _selectedAudioTrackId = audioId;
+        _selectedSubtitleTrackId = subtitleId;
+        _currentFit = newFit;
+      });
+    }
     _fitNotifier.value = newFit;
+    _aspectNotifier.value = aspect;
 
     try {
+      // Apply the selected audio track. null means leave the current track alone.
       if (audioId != null) {
-        _controller.setAudioTrack(audioId);
+        await _controller.setAudioTrack(audioId);
       }
-      if (subtitleId != null) {
-        _controller.setSubtitleTrack(subtitleId);
+
+      // Selecting "None" must actually disable subtitles.
+      if (subtitleId == null) {
+        await _controller.disableSubtitle();
+      } else {
+        await _controller.setSubtitleTrack(subtitleId);
       }
     } catch (e) {
       debugPrint('Track selection error: $e');
@@ -827,10 +872,33 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   void dispose() {
     _controlsTimer?.cancel();
     _fitNotifier.dispose();
+    _aspectNotifier.dispose();
     _playingNotifier.dispose();
     _controller.removeListener(_playerListener);
     _controller.dispose();
     super.dispose();
+  }
+
+  Widget _buildVideoWidget(VlcVideoFit fit) {
+    final player = VlcPlayer(
+      controller: _controller,
+      backgroundColor: Colors.black,
+      fit: fit,
+    );
+
+    if (_selectedAspectRatio == '16:9') {
+      return Center(
+        child: AspectRatio(aspectRatio: 16 / 9, child: player),
+      );
+    }
+
+    if (_selectedAspectRatio == '4:3') {
+      return Center(
+        child: AspectRatio(aspectRatio: 4 / 3, child: player),
+      );
+    }
+
+    return Positioned.fill(child: player);
   }
 
   @override
@@ -845,12 +913,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // VLC video.
-        VlcPlayer(
-          controller: _controller,
-          backgroundColor: Colors.black,
-          fit: _currentFit,
-        ),
+        // VLC video. The selected aspect ratio changes the actual widget
+        // bounds instead of merely cropping the source.
+        _buildVideoWidget(_currentFit),
 
         // Transparent touch layer ABOVE the video. This is deliberate:
         // touching anywhere on the video immediately reveals controls.
@@ -980,10 +1045,11 @@ class _FullscreenVlcView extends StatefulWidget {
   final VlcPlayerController controller;
   final String channelName;
   final ValueNotifier<VlcVideoFit> fitNotifier;
+  final ValueNotifier<String> aspectNotifier;
   final ValueNotifier<bool> isPlayingNotifier;
   final bool isFavorited;
   final VoidCallback onFavToggle;
-  final VoidCallback onSettings;
+  final Future<void> Function() onSettings;
   final Future<void> Function() onPlayPause;
   final VoidCallback onExit;
   final VoidCallback onTouch;
@@ -992,6 +1058,7 @@ class _FullscreenVlcView extends StatefulWidget {
     required this.controller,
     required this.channelName,
     required this.fitNotifier,
+    required this.aspectNotifier,
     required this.isPlayingNotifier,
     required this.isFavorited,
     required this.onFavToggle,
@@ -1030,6 +1097,22 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
     super.dispose();
   }
 
+  Widget _buildFullscreenVideo(VlcVideoFit fit, String aspect) {
+    final player = VlcPlayer(
+      controller: widget.controller,
+      backgroundColor: Colors.black,
+      fit: fit,
+    );
+
+    if (aspect == '16:9') {
+      return Center(child: AspectRatio(aspectRatio: 16 / 9, child: player));
+    }
+    if (aspect == '4:3') {
+      return Center(child: AspectRatio(aspectRatio: 4 / 3, child: player));
+    }
+    return Positioned.fill(child: player);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1037,14 +1120,12 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          ValueListenableBuilder<VlcVideoFit>(
-            valueListenable: widget.fitNotifier,
-            // ignore: unnecessary_underscores
-            builder: (_, fit, __) {
-              return VlcPlayer(
-                controller: widget.controller,
-                backgroundColor: Colors.black,
-                fit: fit,
+          ValueListenableBuilder<String>(
+            valueListenable: widget.aspectNotifier,
+            builder: (_, aspect, __) {
+              return ValueListenableBuilder<VlcVideoFit>(
+                valueListenable: widget.fitNotifier,
+                builder: (_, fit, __) => _buildFullscreenVideo(fit, aspect),
               );
             },
           ),
@@ -1094,7 +1175,6 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
                     padding: const EdgeInsets.only(bottom: 18),
                     child: ValueListenableBuilder<bool>(
                       valueListenable: widget.isPlayingNotifier,
-                      // ignore: unnecessary_underscores
                       builder: (_, playing, __) {
                         return Row(
                           mainAxisAlignment: MainAxisAlignment.center,
@@ -1110,9 +1190,9 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
                             _fullIconButton(
                               icon: Icons.settings,
                               tooltip: 'Player Settings',
-                              onPressed: () {
+                              onPressed: () async {
                                 _showControlsTemporarily();
-                                widget.onSettings();
+                                await widget.onSettings();
                               },
                             ),
                             _fullIconButton(
