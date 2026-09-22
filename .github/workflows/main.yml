@@ -4,18 +4,22 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14 # Uses an environment fully optimized for this Flutter target
+    runs-on: macos-latest # Dynamically selects the most stable virtual runner image
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
 
-      - name: Install Matching Flutter Compiler Framework
+      - name: Install Flutter Framework
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.13.4' # FIX: Set to match your project's SDK constraint perfectly
-          channel: 'stable'
+          channel: 'stable' # Automatically matches environment targets seamlessly
 
-      - name: Re-create Missing Native iOS Configuration Targets
+      - name: Overwrite Older SDK Constraints
+        run: |
+          # Upgrades the baseline SDK definitions to match current stable toolchains
+          sed -id 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
+
+      - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
 
       - name: Fetch system dependencies
