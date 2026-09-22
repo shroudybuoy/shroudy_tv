@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:fijkplayer/fijkplayer.dart';
+import 'package:fijkplayer/fijkplayer.dart'; // 📺 Universal Media Decoder
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,12 +30,7 @@ class ChannelItem {
   final String streamUrl;
   final String category;
 
-  ChannelItem({
-    required this.name, 
-    required this.logoUrl, 
-    required this.streamUrl, 
-    required this.category
-  });
+  ChannelItem({required this.name, required this.logoUrl, required this.streamUrl, required this.category});
 }
 
 class ShroudyTvApp extends StatelessWidget {
@@ -147,6 +142,7 @@ class _MainDashboardState extends State<MainDashboard> {
     });
     await prefs.setStringList('favorite_names', _favoritesList);
   }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -271,7 +267,6 @@ class _MainDashboardState extends State<MainDashboard> {
       ),
     );
   }
-
   Widget _buildPremiumSplitPlayerLayoutView(List<ChannelItem> channels) {
     final relatedChannels = _allChannelsList
         .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
@@ -344,9 +339,9 @@ class _MainDashboardState extends State<MainDashboard> {
                           SizedBox(height: 16),
                           Text("EPG • PROGRAMME GUIDE", style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
                           SizedBox(height: 6),
-                          Text("NOW • Multi-Track Matrix Active", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          Text("NOW • Universal Decoder Enabled", style: TextStyle(color: Colors.grey, fontSize: 12)),
                           SizedBox(height: 12),
-                          Text("Toggle layout aspect-ratio constraints seamlessly using settings panel overlays.", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          Text("Hardware stream decoding active with wide display aspect ratios.", style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
                       ),
                     ),
@@ -381,47 +376,37 @@ class _MainDashboardState extends State<MainDashboard> {
                           color: ShroudyColors.cardNavyBg,
                           shape: const RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(0))),
                           child: InkWell(
-                        onTap: () => setState(() => _currentChannel = relChannel),
-                        child: Padding(
-                          padding: const EdgeInsets.all(8.0),
-                          child: Column(
-                            children: [
-                              Expanded(
-                                child: Container(
-                                  color: ShroudyColors.innerLogoBg,
-                                  width: double.infinity,
-                                  child: Image.network(
-                                    relChannel.logoUrl,
-                                    fit: BoxFit.contain,
-                                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
+                            onTap: () => setState(() => _currentChannel = relChannel),
+                            child: Padding(
+                              padding: const EdgeInsets.all(8.0),
+                              child: Column(
+                                children: [
+                                  Expanded(
+                                    child: Container(
+                                      color: ShroudyColors.innerLogoBg,
+                                      width: double.infinity,
+                                      child: Image.network(relChannel.logoUrl, fit: BoxFit.contain,
+                                          errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(height: 4),
+                                  Text(relChannel.name, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+                                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                                ],
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                relChannel.name,
-                                style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ],
+                            ),
                           ),
                         ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-      ),
-    )
-  ],
-);
-}
+                      );
+                    },
+                  ),
+          ),
+        )
+      ],
+    );
+  }
 }
 
-// ============================================================
-// HARDWARE-ACCELERATED UNIVERSAL DECODER PLAYER CANVAS LAYER
-// ============================================================
 class VideoCanvasPlayerLayer extends StatefulWidget {
   final String streamUrl;
   final String channelName;
@@ -430,12 +415,7 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final VoidCallback onClose;
 
   const VideoCanvasPlayerLayer({
-    super.key, 
-    required this.streamUrl, 
-    required this.channelName, 
-    required this.isFavorited, 
-    required this.onFavToggle, 
-    required this.onClose
+    super.key, required this.streamUrl, required this.channelName, required this.isFavorited, required this.onFavToggle, required this.onClose
   });
 
   @override
@@ -445,10 +425,6 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
 class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   final FijkPlayer _player = FijkPlayer();
   bool _showControls = true;
-  bool _showSettingsMenu = false;
-  
-  String _selectedAspectRatio = 'Default';
-  String _selectedQualityProfile = 'Crisp HD Mode';
 
   @override
   void initState() {
@@ -457,43 +433,15 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   void _initializeDecoderPlayer() async {
-    _player.release();
-    
-    // Core header configuration rules injection
-    await _player.setOption(FijkOption.formatCategory, 'user_agent', 'VLC/3.0.20 Mozilla/5.0');
+    // Forces the player core configuration to bypass server network restrictions smoothly
+    await _player.setOption(FijkOption.formatCategory, 'user_agent', 'VLC/3.0.16 Mozilla/5.0');
     await _player.setOption(FijkOption.formatCategory, 'headers', 'Connection: keep-alive');
-
-    if (_selectedQualityProfile == 'Crisp HD Mode') {
-      // 🚀 FORCE PREMIUM HIGH-DEFINITION GRAPHICS ARCHITECTURE
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec', 1);
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec-auto-rotate', 1);
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec-handle-resolution-change', 1);
-      await _player.setOption(FijkOption.playerCategory, 'framedrop', 0);
-      await _player.setOption(FijkOption.playerCategory, 'video-vector-acceleration', 1);
-      await _player.setOption(FijkOption.formatCategory, 'probesize', 1024000);
-    } else {
-      // 📉 LOW DATA MODE: Drop streams and skip frame smoothing to save mobile data
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec', 0);
-      await _player.setOption(FijkOption.playerCategory, 'framedrop', 5);
-      await _player.setOption(FijkOption.formatCategory, 'probesize', 32000);
-    }
-    
     await _player.setDataSource(widget.streamUrl, autoPlay: true);
     
     Future.delayed(const Duration(seconds: 4), () {
       if (mounted) setState(() => _showControls = false);
     });
   }
-
-        FijkFit _getAspectConstraint() {
-    // FIX: Uses the official native FijkFit structural profiles to adjust video display bounds safely
-    if (_selectedAspectRatio == '16:9') return FijkFit.fill;
-    if (_selectedAspectRatio == '4:3') return FijkFit.cover; // Immersive center crop
-    return FijkFit.contain;
-  }
-
-
-
 
   @override
   void dispose() {
@@ -504,27 +452,20 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: () {
-        if (!_showSettingsMenu) {
-          setState(() => _showControls = !_showControls);
-        }
-      },
+      onTap: () => setState(() => _showControls = !_showControls),
       child: Stack(
         children: [
-          // Video Output Canvas Viewport Frame
           Positioned.fill(
             child: Container(
               color: Colors.black,
               child: FijkView(
                 player: _player,
                 color: Colors.black,
-                fit: _getAspectConstraint(),
+                fit: FijkFit.fill,
               ),
             ),
           ),
-          
-          // Control Bar Overlays Sheet
-          if (_showControls && !_showSettingsMenu)
+          if (_showControls)
             Positioned.fill(
               child: Container(
                 decoration: const BoxDecoration(
@@ -543,103 +484,30 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       children: [
                         IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onClose),
                         Text(widget.channelName, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                        Row(
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.settings, color: Colors.white), 
-                              onPressed: () => setState(() => _showSettingsMenu = true),
-                            ),
-                            IconButton(
-                              icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white), 
-                              onPressed: widget.onFavToggle
-                            ),
-                          ],
-                        )
+                        IconButton(
+                          icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white), 
+                          onPressed: widget.onFavToggle
+                        ),
                       ],
                     ),
                     IconButton(
-                      icon: Icon(_player.state == FijkState.started ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 48),
+                      icon: Icon(
+                        _player.state == FijkState.started 
+                            ? Icons.pause 
+                            : Icons.play_arrow, 
+                        color: Colors.white, 
+                        size: 48,
+                      ),
                       onPressed: () {
-                        setState(() {
-                          if (_player.state == FijkState.started) {
-                            _player.pause();
-                          } else {
-                            _player.start();
-                          }
-                        });
+                        if (_player.state == FijkState.started) {
+                          _player.pause();
+                        } else {
+                          _player.start();
+                        }
+                        setState(() {});
                       },
                     ),
-                    const SizedBox(height: 20)
-                  ],
-                ),
-              ),
-            ),
-            
-          // Interactive Custom Player Settings Box Panel Mapped From Desktop
-          if (_showSettingsMenu)
-            Center(
-              child: Container(
-                width: 320,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: ShroudyColors.cardNavyBg,
-                  border: Border.all(color: ShroudyColors.accentBorder, width: 1.5),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.tune, color: Colors.white, size: 18),
-                        const SizedBox(width: 8),
-                        const Text("Player Settings", style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                        const Spacer(),
-                        IconButton(
-                          icon: const Icon(Icons.close, color: Colors.grey, size: 18),
-                          onPressed: () => setState(() => _showSettingsMenu = false),
-                        )
-                      ],
-                    ),
-                    const Divider(color: ShroudyColors.accentBorder, height: 12),
-                    const SizedBox(height: 12),
-                    
-                    // Dropdown Item 1: Aspect Ratio Setup
-                    const Text("Aspect Ratio:", style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 4),
-                    DropdownButtonFormField<String>(
-                      initialValue: _selectedAspectRatio,
-                      dropdownColor: ShroudyColors.innerLogoBg,
-                      decoration: const InputDecoration(
-                        filled: true,
-                        fillColor: ShroudyColors.innerLogoBg,
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        border: OutlineInputBorder(borderSide: BorderSide(color: ShroudyColors.accentBorder)),
-                      ),
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      items: ['Default', '16:9', '4:3'].map((val) => DropdownMenuItem(value: val, child: Text(val))).toList(),
-                      onChanged: (val) => setState(() => _selectedAspectRatio = val!),
-                    ),
-                    const SizedBox(height: 16),
-                    
-                    // Dropdown Item 2: Strategy Toggle (HD vs Low Data)
-                    const Text("Streaming Strategy Profile:", style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 4),
-                    DropdownButtonFormField<String>(
-                      initialValue: _selectedQualityProfile,
-                      dropdownColor: ShroudyColors.innerLogoBg,
-                      decoration: const InputDecoration(
-                        filled: true,
-                        fillColor: ShroudyColors.innerLogoBg,
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        border: OutlineInputBorder(borderSide: BorderSide(color: ShroudyColors.accentBorder)),
-                      ),
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      items: ['Crisp HD Mode', 'Low Data Mode'].map((val) => DropdownMenuItem(value: val, child: Text(val))).toList(),
-                      onChanged: (val) => setState(() => _selectedQualityProfile = val!),
-                    ),
-                                        const SizedBox(height: 20),
+                    const SizedBox(height: 20),
                   ],
                 ),
               ),
@@ -650,31 +518,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 }
 
-class SHorizontalRowActionButtonGroup extends StatelessWidget {
-  final VoidCallback onSave;
-  const SHorizontalRowActionButtonGroup({super.key, required this.onSave});
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: double.infinity,
-      height: 40,
-      child: ElevatedButton(
-        onPressed: onSave,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: Colors.blueAccent,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
-        ),
-        child: const Text(
-          "Apply & Save", 
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
-        ),
-      ),
-    );
-  }
-}
-
 class BorderBorder extends Border {
-  const BorderBorder({required BorderSide side, double width = 1.0})
+  const BorderBorder({required BorderSide side, double width = 1.0}) 
       : super(top: side, bottom: side, left: side, right: side);
 }
