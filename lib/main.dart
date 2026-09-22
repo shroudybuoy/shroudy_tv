@@ -54,7 +54,6 @@ class ShroudyTvApp extends StatelessWidget {
     );
   }
 }
-
 class MainDashboard extends StatefulWidget {
   const MainDashboard({super.key});
 
@@ -108,14 +107,10 @@ class _MainDashboardState extends State<MainDashboard> {
             currentLogo = _extractAttribute(cleanLine, 'logo');
             currentCategory = _extractAttribute(cleanLine, 'group-title');
 
-            if (currentCategory.isEmpty) {
-              currentCategory = 'Uncategorized';
-            }
-
+            if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
             categoriesSet.add(currentCategory);
           } else if (!cleanLine.startsWith('#')) {
-            if (cleanLine.startsWith('http://') ||
-                cleanLine.startsWith('https://')) {
+            if (cleanLine.startsWith('http://') || cleanLine.startsWith('https://')) {
               _allChannelsList.add(
                 ChannelItem(
                   name: currentName.isEmpty ? 'Unknown Channel' : currentName,
@@ -124,7 +119,6 @@ class _MainDashboardState extends State<MainDashboard> {
                   category: currentCategory,
                 ),
               );
-
               currentName = '';
               currentLogo = '';
             }
@@ -150,16 +144,12 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   String _extractAttribute(String line, String attributeName) {
-    final regExp = RegExp(
-      '$attributeName\\s*=\\s*"([^"]*)"',
-      caseSensitive: false,
-    );
+    final regExp = RegExp('$attributeName\\s*=\\s*"([^"]*)"', caseSensitive: false);
     return regExp.firstMatch(line)?.group(1)?.trim() ?? '';
   }
 
   Future<void> _toggleFavorite(String name) async {
     final prefs = await SharedPreferences.getInstance();
-
     setState(() {
       if (_favoritesList.contains(name)) {
         _favoritesList.remove(name);
@@ -167,7 +157,6 @@ class _MainDashboardState extends State<MainDashboard> {
         _favoritesList.add(name);
       }
     });
-
     await prefs.setStringList('favorite_names', _favoritesList);
   }
 
@@ -175,25 +164,16 @@ class _MainDashboardState extends State<MainDashboard> {
   Widget build(BuildContext context) {
     if (_isLoading) {
       return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(
-            color: ShroudyColors.primaryRed,
-          ),
-        ),
+        body: Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
       );
     }
 
     final filteredChannels = _allChannelsList.where((ch) {
-      final matchesSearch =
-          ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
-
+      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
       if (_selectedCategory == '★ Favorites') {
         return _favoritesList.contains(ch.name) && matchesSearch;
       }
-
-      final matchesCat =
-          _selectedCategory == 'All' || ch.category == _selectedCategory;
-
+      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
       return matchesCat && matchesSearch;
     }).toList();
 
@@ -203,7 +183,6 @@ class _MainDashboardState extends State<MainDashboard> {
           : _buildStandardBrowsingHubView(filteredChannels),
     );
   }
-
   Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
     return Column(
       children: [
@@ -218,9 +197,7 @@ class _MainDashboardState extends State<MainDashboard> {
               childAspectRatio: 1.0,
             ),
             itemCount: channels.length,
-            itemBuilder: (context, index) {
-              return _buildChannelItemCard(channels[index]);
-            },
+            itemBuilder: (context, index) => _buildChannelItemCard(channels[index]),
           ),
         ),
       ],
@@ -235,12 +212,7 @@ class _MainDashboardState extends State<MainDashboard> {
     ];
 
     return Container(
-      padding: const EdgeInsets.only(
-        top: 40,
-        left: 16,
-        right: 16,
-        bottom: 12,
-      ),
+      padding: const EdgeInsets.only(top: 40, left: 16, right: 16, bottom: 12),
       child: Column(
         children: [
           SizedBox(
@@ -251,26 +223,15 @@ class _MainDashboardState extends State<MainDashboard> {
               itemBuilder: (context, i) {
                 final cat = finalCategories[i];
                 final isSelected = cat == _selectedCategory;
-
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: ChoiceChip(
-                    label: Text(
-                      cat,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
+                    label: Text(cat, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     selected: isSelected,
                     selectedColor: ShroudyColors.primaryRed,
                     backgroundColor: ShroudyColors.cardNavyBg,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    onSelected: (val) {
-                      setState(() => _selectedCategory = cat);
-                    },
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    onSelected: (val) => setState(() => _selectedCategory = cat),
                   ),
                 );
               },
@@ -285,12 +246,8 @@ class _MainDashboardState extends State<MainDashboard> {
               hintStyle: const TextStyle(color: Colors.grey),
               fillColor: ShroudyColors.cardNavyBg,
               filled: true,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: BorderSide.none,
-              ),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 16),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
             ),
           ),
         ],
@@ -301,9 +258,7 @@ class _MainDashboardState extends State<MainDashboard> {
   Widget _buildChannelItemCard(ChannelItem channel) {
     return Card(
       color: ShroudyColors.cardNavyBg,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.zero,
-      ),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
       child: InkWell(
         onTap: () => setState(() => _currentChannel = channel),
         child: Padding(
@@ -317,98 +272,50 @@ class _MainDashboardState extends State<MainDashboard> {
                   child: Image.network(
                     channel.logoUrl,
                     fit: BoxFit.contain,
-                    errorBuilder: (_, _, _) =>
-                        const Icon(Icons.tv, color: Colors.white),
+                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
                   ),
                 ),
               ),
               const SizedBox(height: 6),
-              Text(
-                channel.name,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+              Text(channel.name, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
               const SizedBox(height: 4),
-              const Text(
-                '● LIVE',
-                style: TextStyle(
-                  color: ShroudyColors.liveIndicator,
-                  fontSize: 8,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
+              const Text('● LIVE', style: TextStyle(color: ShroudyColors.liveIndicator, fontSize: 8, fontWeight: FontWeight.bold)),
             ],
           ),
         ),
       ),
     );
   }
-
-  Widget _buildPremiumSplitPlayerLayoutView(
-    List<ChannelItem> channels,
-  ) {
+  Widget _buildPremiumSplitPlayerLayoutView(List<ChannelItem> channels) {
     final relatedChannels = _allChannelsList
-        .where(
-          (ch) =>
-              ch.category == _currentChannel!.category &&
-              ch.name != _currentChannel!.name,
-        )
+        .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
         .toList();
 
     return Column(
       children: [
         Padding(
-          padding: const EdgeInsets.only(
-            top: 40,
-            left: 24,
-            right: 24,
-            bottom: 12,
-          ),
+          padding: const EdgeInsets.only(top: 40, left: 24, right: 24, bottom: 12),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Expanded(
                 child: Text(
                   'NOW PLAYING: ${_currentChannel!.name.toUpperCase()}',
-                  style: const TextStyle(
-                    color: ShroudyColors.primaryRed,
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
+                  style: const TextStyle(color: ShroudyColors.primaryRed, fontSize: 20, fontWeight: FontWeight.bold),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
               const SizedBox(width: 16),
               ElevatedButton(
-                onPressed: () =>
-                    setState(() => _currentChannel = null),
+                onPressed: () => setState(() => _currentChannel = null),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: ShroudyColors.cardNavyBg,
-                  side: const BorderSide(
-                    color: ShroudyColors.accentBorder,
-                    width: 1.5,
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 12,
-                  ),
+                  side: const BorderSide(color: ShroudyColors.accentBorder, width: 1.5),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                 ),
-                child: const Text(
-                  '← Back',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
+                child: const Text('← Back', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               ),
             ],
           ),
@@ -428,12 +335,9 @@ class _MainDashboardState extends State<MainDashboard> {
                       key: ValueKey(_currentChannel!.streamUrl),
                       streamUrl: _currentChannel!.streamUrl,
                       channelName: _currentChannel!.name,
-                      isFavorited:
-                          _favoritesList.contains(_currentChannel!.name),
-                      onFavToggle: () =>
-                          _toggleFavorite(_currentChannel!.name),
-                      onClose: () =>
-                          setState(() => _currentChannel = null),
+                      isFavorited: _favoritesList.contains(_currentChannel!.name),
+                      onFavToggle: () => _toggleFavorite(_currentChannel!.name),
+                      onClose: () => setState(() => _currentChannel = null),
                     ),
                   ),
                 ),
@@ -444,52 +348,19 @@ class _MainDashboardState extends State<MainDashboard> {
                     padding: const EdgeInsets.all(20),
                     decoration: const BoxDecoration(
                       color: ShroudyColors.cardNavyBg,
-                      border: BorderBorder(
-                        side: BorderSide(
-                          color: ShroudyColors.accentBorder,
-                          width: 1,
-                        ),
-                      ),
+                      border: BorderBorder(side: BorderSide(color: ShroudyColors.accentBorder, width: 1)),
                     ),
                     child: const SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            'YOU ARE WATCHING',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
+                          Text('YOU ARE WATCHING', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                           SizedBox(height: 16),
-                          Text(
-                            'EPG • PROGRAMME GUIDE',
-                            style: TextStyle(
-                              color: ShroudyColors.primaryRed,
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
+                          Text('EPG • PROGRAMME GUIDE', style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
                           SizedBox(height: 6),
-                          Text(
-                            'NOW • libVLC / VideoLAN decoder',
-                            style: TextStyle(
-                              color: Colors.grey,
-                              fontSize: 12,
-                            ),
-                          ),
+                          Text('NOW • libVLC / VideoLAN decoder', style: TextStyle(color: Colors.grey, fontSize: 12)),
                           SizedBox(height: 12),
-                          Text(
-                            'VLC-based playback supports network streams '
-                            'including MPEG-TS and HLS, subject to the '
-                            'stream/server and device compatibility.',
-                            style: TextStyle(
-                              color: Colors.grey,
-                              fontSize: 12,
-                            ),
-                          ),
+                          Text('VLC-based playback supports network streams including MPEG-TS and HLS, subject to stream/server compatibility.', style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
                       ),
                     ),
@@ -501,53 +372,27 @@ class _MainDashboardState extends State<MainDashboard> {
         ),
         const Padding(
           padding: EdgeInsets.only(left: 24, top: 16, bottom: 8),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              '★ CHANNELS FROM SAME CATEGORY',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
+          child: Align(alignment: Alignment.centerLeft, child: Text('★ CHANNELS FROM SAME CATEGORY', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold))),
         ),
         Expanded(
           flex: 1,
           child: Padding(
-            padding: const EdgeInsets.only(
-              left: 24,
-              right: 24,
-              bottom: 20,
-            ),
+            padding: const EdgeInsets.only(left: 24, right: 24, bottom: 20),
             child: relatedChannels.isEmpty
-                ? const Center(
-                    child: Text(
-                      'No related channels in this category',
-                      style: TextStyle(
-                        color: Colors.grey,
-                        fontSize: 12,
-                      ),
-                    ),
-                  )
+                ? const Center(child: Text('No related channels in this category', style: TextStyle(color: Colors.grey, fontSize: 12)))
                 : ListView.builder(
                     scrollDirection: Axis.horizontal,
                     itemCount: relatedChannels.length,
                     itemBuilder: (context, idx) {
                       final relChannel = relatedChannels[idx];
-
                       return Container(
                         width: 140,
                         margin: const EdgeInsets.only(right: 12),
                         child: Card(
                           color: ShroudyColors.cardNavyBg,
-                          shape: const RoundedRectangleBorder(
-                            borderRadius: BorderRadius.zero,
-                          ),
+                          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
                           child: InkWell(
-                            onTap: () =>
-                                setState(() => _currentChannel = relChannel),
+                            onTap: () => setState(() => _currentChannel = relChannel),
                             child: Padding(
                               padding: const EdgeInsets.all(8),
                               child: Column(
@@ -556,28 +401,11 @@ class _MainDashboardState extends State<MainDashboard> {
                                     child: Container(
                                       color: ShroudyColors.innerLogoBg,
                                       width: double.infinity,
-                                      child: Image.network(
-                                        relChannel.logoUrl,
-                                        fit: BoxFit.contain,
-                                        errorBuilder: (_, _, _) =>
-                                            const Icon(
-                                          Icons.tv,
-                                          color: Colors.white,
-                                        ),
-                                      ),
+                                      child: Image.network(relChannel.logoUrl, fit: BoxFit.contain, errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
                                     ),
                                   ),
                                   const SizedBox(height: 4),
-                                  Text(
-                                    relChannel.name,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
+                                  Text(relChannel.name, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
                                 ],
                               ),
                             ),
@@ -592,7 +420,6 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
 }
-
 class VideoCanvasPlayerLayer extends StatefulWidget {
   final String streamUrl;
   final String channelName;
@@ -610,15 +437,14 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   });
 
   @override
-  State<VideoCanvasPlayerLayer> createState() =>
-      _VideoCanvasPlayerLayerState();
+  State<VideoCanvasPlayerLayer> createState() => _VideoCanvasPlayerLayerState();
 }
 
-class _VideoCanvasPlayerLayerState
-    extends State<VideoCanvasPlayerLayer> {
+class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late VlcPlayerController _controller;
   bool _showControls = true;
   String? _errorText;
+  VlcVideoFit _currentFit = VlcVideoFit.contain;
 
   @override
   void initState() {
@@ -630,8 +456,6 @@ class _VideoCanvasPlayerLayerState
     _controller = VlcPlayerController(
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
-        // VLC/libVLC network tuning. MPEG-TS streams often benefit
-        // from a small network cache when the source has jitter.
         mediaOptions: const [
           ':network-caching=1000',
           ':live-caching=1000',
@@ -643,18 +467,14 @@ class _VideoCanvasPlayerLayerState
       ),
       autoPlay: true,
     );
-
     _controller.addListener(_playerListener);
   }
 
   void _playerListener() {
     if (!mounted) return;
-
     final value = _controller.value;
-
     if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
       setState(() => _errorText = value.errorMessage);
-      debugPrint('libVLC error: ${value.errorMessage}');
     }
   }
 
@@ -666,20 +486,87 @@ class _VideoCanvasPlayerLayerState
   }
 
   Future<void> _togglePlayPause() async {
-  try {
-    if (_controller.value.isPlaying) {
-      await _controller.pause();
-    } else {
-      await _controller.play();
+    try {
+      if (_controller.value.isPlaying) {
+        await _controller.pause();
+      } else {
+        await _controller.play();
+      }
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('Playback error: $e');
     }
-
-    if (mounted) {
-      setState(() {});
-    }
-  } catch (e) {
-    debugPrint('Playback control error: $e');
   }
-}
+
+  void _cycleAspectRatio() {
+    setState(() {
+      if (_currentFit == VlcVideoFit.contain) {
+        _currentFit = VlcVideoFit.fill;
+      } else if (_currentFit == VlcVideoFit.fill) {
+        _currentFit = VlcVideoFit.cover;
+      } else {
+        _currentFit = VlcVideoFit.contain;
+      }
+    });
+  }
+
+      void _showTrackSelectionDialog(
+    String title,
+    List<VlcTrackDescription> tracks,
+    Function(int) onSelected,
+  ) {
+    if (tracks.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No alternative $title tracks found.')),
+      );
+      return;
+    }
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: ShroudyColors.cardNavyBg,
+        title: Text('Select $title', style: const TextStyle(color: Colors.white)),
+        content: SizedBox(
+          width: 300,
+          child: ListView(
+            shrinkWrap: true,
+            children: tracks.map((track) {
+                            return ListTile(
+                title: Text(
+                  track.name,
+                  style: const TextStyle(color: Colors.white),
+                ),
+                onTap: () {
+                  onSelected(track.id);
+                  Navigator.pop(context);
+                },
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _changeAudioTrack() async {
+    final tracks = await _controller.getAudioTracks();
+    _showTrackSelectionDialog('Audio Track', tracks, (id) async {
+      await _controller.setAudioTrack(id);
+    });
+  }
+
+  Future<void> _changeSubtitleTrack() async {
+    final tracks = await _controller.getSubtitleTracks();
+    _showTrackSelectionDialog('Subtitle', tracks, (id) async {
+      await _controller.setSubtitleTrack(id);
+    });
+  }
+
+
+
+  void _toggleFullscreen() {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Toggling Player View Mode...')));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -688,86 +575,59 @@ class _VideoCanvasPlayerLayerState
       child: Stack(
         children: [
           Positioned.fill(
-            child: VlcPlayer(
-              controller: _controller,
-              backgroundColor: Colors.black,
-              fit: VlcVideoFit.contain,
-            ),
+            child: VlcPlayer(controller: _controller, backgroundColor: Colors.black, fit: _currentFit),
           ),
-
           if (_errorText != null)
             Positioned.fill(
               child: Container(
                 color: Colors.black54,
                 alignment: Alignment.center,
                 padding: const EdgeInsets.all(24),
-                child: Text(
-                  'VLC playback error:\n$_errorText',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white),
-                ),
+                child: Text('VLC playback error:\n$_errorText', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
               ),
             ),
-
           if (_showControls)
             Positioned.fill(
-              child: IgnorePointer(
-                ignoring: false,
-                child: Container(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Row(
-                        mainAxisAlignment:
-                            MainAxisAlignment.spaceBetween,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            widget.channelName,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, shadows: [Shadow(blurRadius: 4.0, color: Colors.black)]),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.75), borderRadius: BorderRadius.circular(12)),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
+                          IconButton(icon: Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white), onPressed: _togglePlayPause),
+                          IconButton(icon: const Icon(Icons.aspect_ratio, color: Colors.white), tooltip: 'Aspect Ratio', onPressed: _cycleAspectRatio),
+                          IconButton(icon: const Icon(Icons.audiotrack, color: Colors.white), tooltip: 'Audio Track', onPressed: _changeAudioTrack),
+                          IconButton(icon: const Icon(Icons.subtitles, color: Colors.white), tooltip: 'Subtitles', onPressed: _changeSubtitleTrack),
                           IconButton(
-                            icon: const Icon(
-                              Icons.close,
-                              color: Colors.white,
-                            ),
-                            onPressed: widget.onClose,
-                          ),
-                          Expanded(
-                            child: Text(
-                              widget.channelName,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          IconButton(
-                            icon: Icon(
-                              widget.isFavorited
-                                  ? Icons.star
-                                  : Icons.star_border,
-                              color: widget.isFavorited
-                                  ? ShroudyColors.goldText
-                                  : Colors.white,
-                            ),
+                            icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white),
+                            tooltip: 'Favorite',
                             onPressed: widget.onFavToggle,
                           ),
+                          IconButton(icon: const Icon(Icons.fullscreen, color: Colors.white), tooltip: 'Fullscreen', onPressed: _toggleFullscreen),
                         ],
                       ),
-                      IconButton(
-                        icon: Icon(
-                          _controller.value.isPlaying
-                              ? Icons.pause
-                              : Icons.play_arrow,
-                          color: Colors.white,
-                          size: 48,
-                        ),
-                        onPressed: _togglePlayPause,
-                      ),
-                      const SizedBox(height: 20),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -782,13 +642,6 @@ extension on VlcPlayerValue {
 }
 
 class BorderBorder extends Border {
-  const BorderBorder({
-    required BorderSide side,
-    double width = 1.0,
-  }) : super(
-          top: side,
-          bottom: side,
-          left: side,
-          right: side,
-        );
+  const BorderBorder({required BorderSide side, double width = 1.0})
+      : super(top: side, bottom: side, left: side, right: side);
 }
