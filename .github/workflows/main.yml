@@ -4,15 +4,15 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14 # Uses an environment fully optimized for this Flutter target
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
 
-      - name: Install Flutter compiler framework
+      - name: Install Matching Flutter Compiler Framework
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.x'
+          flutter-version: '3.13.4' # FIX: Set to match your project's SDK constraint perfectly
           channel: 'stable'
 
       - name: Re-create Missing Native iOS Configuration Targets
