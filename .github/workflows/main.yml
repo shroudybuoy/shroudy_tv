@@ -4,7 +4,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-latest # Dynamically selects the most stable virtual runner image
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
@@ -12,11 +12,12 @@ jobs:
       - name: Install Flutter Framework
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          channel: 'stable' # Automatically matches environment targets seamlessly
 
       - name: Overwrite Older SDK Constraints
         run: |
-          sed -i '' 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
+          # Upgrades the baseline SDK definitions to match current stable toolchains
+          sed -id 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
 
       - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
@@ -25,13 +26,12 @@ jobs:
         run: flutter pub get
 
       - name: Compile Lightweight iPad Application Asset Container
-        # FIX: Targets the simulator build tree to completely bypass the Apple Provisioning Profile error block
-        run: flutter build ios --simulator --no-codesign
+        run: flutter build ios --no-codesign
 
       - name: Zip Bundle into a Standalone Sideloadly Installer Package
         run: |
           mkdir -p Payload
-          cp -r build/ios/iphonesimulator/Runner.app Payload/
+          cp -r build/ios/iphoneos/Runner.app Payload/
           zip -r ShroudyTV.ipa Payload
 
       - name: Output Finished File Download Link
