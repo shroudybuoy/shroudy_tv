@@ -31,14 +31,16 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # 📺 Premium VLC Engine Media Player for iPad stream pipelines (Replaces old video_player)
+  # 📺 Core LibVLC Media Engine Player 
   flutter_vlc_player: ^7.4.4
 
-  # 📥 Asynchronous HTTP Network Request client
+  # 📥 Asynchronous Data Fetching Client
   http: ^1.2.2
 
-  # 💾 Persistent Local Disk Storage Engine
+  # 💾 Persistent Local Cache Storage
   shared_preferences: ^2.3.2
+  
+
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
