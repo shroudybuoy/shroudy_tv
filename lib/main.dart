@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_player/video_player.dart';
+import 'package:fijkplayer/fijkplayer.dart'; // 📺 Universal Media Decoder
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,12 +30,7 @@ class ChannelItem {
   final String streamUrl;
   final String category;
 
-  ChannelItem({
-    required this.name, 
-    required this.logoUrl, 
-    required this.streamUrl, 
-    required this.category
-  });
+  ChannelItem({required this.name, required this.logoUrl, required this.streamUrl, required this.category});
 }
 
 class ShroudyTvApp extends StatelessWidget {
@@ -147,6 +142,7 @@ class _MainDashboardState extends State<MainDashboard> {
     });
     await prefs.setStringList('favorite_names', _favoritesList);
   }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -256,11 +252,8 @@ class _MainDashboardState extends State<MainDashboard> {
                 child: Container(
                   color: ShroudyColors.innerLogoBg,
                   width: double.infinity,
-                  child: Image.network(
-                    channel.logoUrl,
-                    fit: BoxFit.contain,
-                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
-                  ),
+                  child: Image.network(channel.logoUrl, fit: BoxFit.contain, 
+                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
                 ),
               ),
               const SizedBox(height: 6),
@@ -346,7 +339,7 @@ class _MainDashboardState extends State<MainDashboard> {
                           SizedBox(height: 16),
                           Text("EPG • PROGRAMME GUIDE", style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
                           SizedBox(height: 6),
-                          Text("NOW • Powered by VLC Core", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          Text("NOW • Universal Decoder Enabled", style: TextStyle(color: Colors.grey, fontSize: 12)),
                           SizedBox(height: 12),
                           Text("Hardware stream decoding active with wide display aspect ratios.", style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
@@ -430,31 +423,21 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
 }
 
 class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
-  late VideoPlayerController _controller;
+  final FijkPlayer _player = FijkPlayer();
   bool _showControls = true;
-  bool _hasError = false;
 
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.networkUrl(
-      Uri.parse(widget.streamUrl),
-      httpHeaders: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 VLC/3.0.16',
-      },
-    );
+    _initializeDecoderPlayer();
+  }
 
-    _controller.initialize().then((_) {
-      if (mounted) {
-        setState(() => _hasError = false);
-        _controller.play();
-      }
-    }).catchError((error) {
-      if (mounted) {
-        setState(() => _hasError = true);
-      }
-    });
-
+  void _initializeDecoderPlayer() async {
+    // Forces the player core configuration to bypass server network restrictions smoothly
+    await _player.setOption(FijkOption.formatCategory, 'user_agent', 'VLC/3.0.16 Mozilla/5.0');
+    await _player.setOption(FijkOption.formatCategory, 'headers', 'Connection: keep-alive');
+    await _player.setDataSource(widget.streamUrl, autoPlay: true);
+    
     Future.delayed(const Duration(seconds: 4), () {
       if (mounted) setState(() => _showControls = false);
     });
@@ -462,7 +445,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   @override
   void dispose() {
-    _controller.dispose();
+    _player.release();
     super.dispose();
   }
 
@@ -473,20 +456,16 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       child: Stack(
         children: [
           Positioned.fill(
-            child: _hasError
-                ? const Center(child: Icon(Icons.error_outline, color: ShroudyColors.primaryRed, size: 42))
-                : _controller.value.isInitialized
-                    ? FittedBox(
-                        fit: BoxFit.fill,
-                        child: SizedBox(
-                          width: _controller.value.size.width,
-                          height: _controller.value.size.height,
-                          child: VideoPlayer(_controller),
-                        ),
-                      )
-                    : const Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
+            child: Container(
+              color: Colors.black,
+              child: FijkView(
+                player: _player,
+                color: Colors.black,
+                fit: FijkFit.fill,
+              ),
+            ),
           ),
-          if (_showControls && !_hasError)
+          if (_showControls)
             Positioned.fill(
               child: Container(
                 decoration: const BoxDecoration(
@@ -505,22 +484,28 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       children: [
                         IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onClose),
                         Text(widget.channelName, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                                                IconButton(
-                          icon: Icon(
-                            widget.isFavorited ? Icons.star : Icons.star_border,
-                            color: widget.isFavorited ? ShroudyColors.goldText : Colors.white,
-                          ),
-                          onPressed: widget.onFavToggle,
+                        IconButton(
+                          icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white), 
+                          onPressed: widget.onFavToggle
                         ),
                       ],
                     ),
                     IconButton(
                       icon: Icon(
-                        _controller.value.isPlaying ? Icons.pause : Icons.play_arrow,
-                        color: Colors.white,
+                        _player.state == FijkState.started 
+                            ? Icons.pause 
+                            : Icons.play_arrow, 
+                        color: Colors.white, 
                         size: 48,
                       ),
-                      onPressed: () => setState(() => _controller.value.isPlaying ? _controller.pause() : _controller.play()),
+                      onPressed: () {
+                        if (_player.state == FijkState.started) {
+                          _player.pause();
+                        } else {
+                          _player.start();
+                        }
+                        setState(() {});
+                      },
                     ),
                     const SizedBox(height: 20),
                   ],
@@ -534,6 +519,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 }
 
 class BorderBorder extends Border {
-  const BorderBorder({required BorderSide side, double width = 1.0})
+  const BorderBorder({required BorderSide side, double width = 1.0}) 
       : super(top: side, bottom: side, left: side, right: side);
 }
