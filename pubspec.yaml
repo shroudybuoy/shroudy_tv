@@ -31,19 +31,18 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # 📺 Core LibVLC Media Engine Player 
-  fijkplayer: ^1.0.1
+  # 📺 Lightweight Universal Media Engine Decoder (Restored)
+    # 📺 Lightweight Universal Media Engine Decoder (Restored)
+  fijkplayer: ^0.11.0
 
-  # 📥 Asynchronous Data Fetching Client
+  # 📥 Asynchronous HTTP Network Request client
   http: ^1.2.2
 
-  # 💾 Persistent Local Cache Storage
+  # 💾 Persistent Local Disk Storage Engine
   shared_preferences: ^2.3.2
-  
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+
 
 dev_dependencies:
   flutter_test:
