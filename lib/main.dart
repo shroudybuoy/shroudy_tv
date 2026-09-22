@@ -77,7 +77,7 @@ class _MainDashboardState extends State<MainDashboard> {
   Future<void> _fetchM3uPlaylist() async {
     try {
       final response = await http.get(Uri.parse(
-          "https://githubusercontent.com"));
+          "https://raw.githubusercontent.com/shroudybuoy/TV-Channels/refs/heads/main/channel%20playlist.m3u"));
       
       if (response.statusCode == 200) {
         final lines = response.body.split('\n');
