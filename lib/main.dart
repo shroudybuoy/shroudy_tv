@@ -448,7 +448,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   bool _showSettingsMenu = false;
   
   String _selectedAspectRatio = 'Default';
-  String _selectedBitrateProfile = 'Highest HD'; // Tracks your bitrate profiles
+  String _selectedQualityProfile = 'Crisp HD Mode';
 
   @override
   void initState() {
@@ -459,29 +459,23 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   void _initializeDecoderPlayer() async {
     _player.release();
     
-    // Core User-Agent header settings
+    // Core header configuration rules injection
     await _player.setOption(FijkOption.formatCategory, 'user_agent', 'VLC/3.0.20 Mozilla/5.0');
     await _player.setOption(FijkOption.formatCategory, 'headers', 'Connection: keep-alive');
 
-    // ⚙️ BITRATE PROFILE SELECTION CONDITIONAL LOOP ENGINE
-    if (_selectedBitrateProfile == 'Highest HD') {
-      // Unlocks maximum hardware decoding parameters with high-capacity bandwidth allocations
+    if (_selectedQualityProfile == 'Crisp HD Mode') {
+      // 🚀 FORCE PREMIUM HIGH-DEFINITION GRAPHICS ARCHITECTURE
       await _player.setOption(FijkOption.playerCategory, 'mediacodec', 1);
       await _player.setOption(FijkOption.playerCategory, 'mediacodec-auto-rotate', 1);
       await _player.setOption(FijkOption.playerCategory, 'mediacodec-handle-resolution-change', 1);
       await _player.setOption(FijkOption.playerCategory, 'framedrop', 0);
       await _player.setOption(FijkOption.playerCategory, 'video-vector-acceleration', 1);
       await _player.setOption(FijkOption.formatCategory, 'probesize', 1024000);
-    } else if (_selectedBitrateProfile == 'Medium Quality') {
-      // Balances frame rendering loops to stay stable over standard network packets
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec', 1);
-      await _player.setOption(FijkOption.playerCategory, 'framedrop', 1);
-      await _player.setOption(FijkOption.formatCategory, 'probesize', 256000);
     } else {
-      // Low Data Mode: Constrains stream buffers to force fetch the lowest bandwidth stream track available
-      await _player.setOption(FijkOption.playerCategory, 'mediacodec', 0); 
-      await _player.setOption(FijkOption.playerCategory, 'framedrop', 5);  
-      await _player.setOption(FijkOption.formatCategory, 'probesize', 32000); 
+      // 📉 LOW DATA MODE: Drop streams and skip frame smoothing to save mobile data
+      await _player.setOption(FijkOption.playerCategory, 'mediacodec', 0);
+      await _player.setOption(FijkOption.playerCategory, 'framedrop', 5);
+      await _player.setOption(FijkOption.formatCategory, 'probesize', 32000);
     }
     
     await _player.setDataSource(widget.streamUrl, autoPlay: true);
@@ -491,18 +485,21 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     });
   }
 
-  FijkFit _getAspectConstraint() {
+        FijkFit _getAspectConstraint() {
+    // FIX: Uses the official native FijkFit structural profiles to adjust video display bounds safely
     if (_selectedAspectRatio == '16:9') return FijkFit.fill;
-    if (_selectedAspectRatio == '4:3') return FijkFit.cover;
+    if (_selectedAspectRatio == '4:3') return FijkFit.cover; // Immersive center crop
     return FijkFit.contain;
   }
+
+
+
 
   @override
   void dispose() {
     _player.release();
     super.dispose();
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -579,7 +576,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
             ),
             
           // Interactive Custom Player Settings Box Panel Mapped From Desktop
-                    // Interactive Custom Player Settings Box Panel Mapped From Desktop Layout
           if (_showSettingsMenu)
             Center(
               child: Container(
@@ -609,11 +605,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     const Divider(color: ShroudyColors.accentBorder, height: 12),
                     const SizedBox(height: 12),
                     
-                    // Dropdown Item 1: Aspect Ratio Setup Matrix Config
+                    // Dropdown Item 1: Aspect Ratio Setup
                     const Text("Aspect Ratio:", style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 4),
                     DropdownButtonFormField<String>(
-                      initialValue: _selectedAspectRatio, // FIX: Changed initialValue to value
+                      initialValue: _selectedAspectRatio,
                       dropdownColor: ShroudyColors.innerLogoBg,
                       decoration: const InputDecoration(
                         filled: true,
@@ -627,11 +623,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     ),
                     const SizedBox(height: 16),
                     
-                    // Dropdown Item 2: Quality Bitrate Selection List
-                    const Text("Quality Bitrate:", style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.bold)),
+                    // Dropdown Item 2: Strategy Toggle (HD vs Low Data)
+                    const Text("Streaming Strategy Profile:", style: TextStyle(color: Colors.grey, fontSize: 12, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 4),
                     DropdownButtonFormField<String>(
-                      initialValue: _selectedBitrateProfile, // FIX: Linked to your bitrate profile configuration state
+                      initialValue: _selectedQualityProfile,
                       dropdownColor: ShroudyColors.innerLogoBg,
                       decoration: const InputDecoration(
                         filled: true,
@@ -640,22 +636,14 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         border: OutlineInputBorder(borderSide: BorderSide(color: ShroudyColors.accentBorder)),
                       ),
                       style: const TextStyle(color: Colors.white, fontSize: 13),
-                      items: ['Highest HD', 'Medium Quality', 'Low Data Mode'].map((val) => DropdownMenuItem(value: val, child: Text(val))).toList(),
-                      onChanged: (val) => setState(() => _selectedBitrateProfile = val!),
+                      items: ['Crisp HD Mode', 'Low Data Mode'].map((val) => DropdownMenuItem(value: val, child: Text(val))).toList(),
+                      onChanged: (val) => setState(() => _selectedQualityProfile = val!),
                     ),
-                    const SizedBox(height: 24),
-                    
-                    // Trigger Buttons Base Row Actions
-                    SHorizontalRowActionButtonGroup(
-                      onSave: () {
-                        setState(() => _showSettingsMenu = false);
-                        _initializeDecoderPlayer(); // Hot-reloads the hardware engine buffers smoothly
-                      },
-                    )
+                                        const SizedBox(height: 20),
                   ],
                 ),
               ),
-            )
+            ),
         ],
       ),
     );
