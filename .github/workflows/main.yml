@@ -4,7 +4,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest # Remote cloud server image offloads the compilation task safely
+    runs-on: macos-latest # Remote cloud server image builds the installer framework safely
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
@@ -21,9 +21,9 @@ jobs:
       - name: Re-create Native iOS Layout Configuration Targets
         run: flutter create . --platforms=ios
 
-      - name: Inject Apple Transport Security Exceptions
+      - name: Inject Apple Transport Networking Exceptions
         run: |
-          # Automatically injects cross-platform transport network permissions directly into Info.plist
+          # Automatically injects network bypass permissions directly into Info.plist
           PLIST_PATH="ios/Runner/Info.plist"
           sed -i '' '/<dict>/a\
           <key>NSAppTransportSecurity</key>\
