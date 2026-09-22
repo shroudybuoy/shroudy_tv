@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_vlc_player/flutter_vlc_player.dart'; // 📺 LibVLC Core
+import 'package:flutter_vlc_player/flutter_vlc_player.dart'; // 📺 LibVLC Drivers
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,12 +30,7 @@ class ChannelItem {
   final String streamUrl;
   final String category;
 
-  ChannelItem({
-    required this.name, 
-    required this.logoUrl, 
-    required this.streamUrl, 
-    required this.category
-  });
+  ChannelItem({required this.name, required this.logoUrl, required this.streamUrl, required this.category});
 }
 
 class ShroudyTvApp extends StatelessWidget {
@@ -492,18 +487,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         ),
                       ],
                     ),
-                                        IconButton(
+                    IconButton(
                       icon: Icon(_vlcViewController.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 48),
                       onPressed: () async {
-                                                if (_vlcViewController.value.isPlaying) {
-                          await _vlcViewController.pause();
-                        } else {
+                        if (_vlcViewController.value.isPlaying) {
+await _vlcViewController.pause();
+                          } else {
                           await _vlcViewController.play();
-                        }
-                        setState(() {}); // Clean syntax line fix
-                      },
+                          }
+                        setState(() {});
+                        },
                     ),
-
                     const SizedBox(height: 20)
                     ],
                 ),
