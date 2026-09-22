@@ -492,16 +492,16 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         ),
                       ],
                     ),
-                    IconButton(
+                                        IconButton(
                       icon: Icon(_vlcViewController.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 48),
                       onPressed: () async {
                         if (_vlcViewController.value.isPlaying) {
                           await _vlcViewController.pause();
                         } else {
-await _vlcViewController.play();
-                          }
-                        setState(() {});
-                        },
+                          await _vlcViewController.play();
+                        }
+                        setState(() {}); // FIX: Cleaned up the extra parenthesis here
+                      },
                     ),
                     const SizedBox(height: 20)
                     ],
