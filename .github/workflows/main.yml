@@ -1,10 +1,10 @@
 name: Build Shroudy TV iPad (.ipa)
 on:
-  workflow_dispatch: # Allows you to trigger the build manually with a single click
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest # Remote cloud server environment builds the Apple installer safely
+    runs-on: macos-latest
     steps:
       - name: Checkout project files
         uses: actions/checkout@v4
@@ -14,6 +14,9 @@ jobs:
         with:
           flutter-version: '3.22.x'
           channel: 'stable'
+
+      - name: Re-create Missing Native iOS Configuration Targets
+        run: flutter create . --platforms=ios
 
       - name: Fetch system dependencies
         run: flutter pub get
