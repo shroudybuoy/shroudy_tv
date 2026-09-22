@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_vlc_player/flutter_vlc_player.dart'; // 📺 LibVLC Core
+import 'package:video_player/video_player.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -78,7 +78,7 @@ class _MainDashboardState extends State<MainDashboard> {
   Future<void> _fetchM3uPlaylist() async {
     try {
       final response = await http.get(Uri.parse(
-          "https://raw.githubusercontent.com/shroudybuoy/TV-Channels/refs/heads/main/channel%20playlist.m3u"));
+          "https://githubusercontent.com"));
       
       if (response.statusCode == 200) {
         final lines = response.body.split('\n');
@@ -346,9 +346,9 @@ class _MainDashboardState extends State<MainDashboard> {
                           SizedBox(height: 16),
                           Text("EPG • PROGRAMME GUIDE", style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
                           SizedBox(height: 6),
-                          Text("NOW • Powered by LibVLC", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          Text("NOW • Powered by VLC Core", style: TextStyle(color: Colors.grey, fontSize: 12)),
                           SizedBox(height: 12),
-                          Text("Hardware stream decoding active with zero layout constraints.", style: TextStyle(color: Colors.grey, fontSize: 12)),
+                          Text("Hardware stream decoding active with wide display aspect ratios.", style: TextStyle(color: Colors.grey, fontSize: 12)),
                         ],
                       ),
                     ),
@@ -430,23 +430,30 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
 }
 
 class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
-  late VlcPlayerController _vlcViewController;
+  late VideoPlayerController _controller;
   bool _showControls = true;
+  bool _hasError = false;
 
   @override
   void initState() {
     super.initState();
-    _vlcViewController = VlcPlayerController.network(
-      widget.streamUrl,
-      hwAcc: HwAcc.full,
-      options: VlcPlayerOptions(
-        advanced: VlcAdvancedOptions([VlcAdvancedOptions.networkCaching(1500)]),
-        http: VlcHttpOptions(['--http-user-agent=VLC/3.0.16 Mozilla/5.0']),
-        // Enforces texture-backed digital paint display pipelines
-        video: VlcVideoOptions(['--vout=ios']),
-      ),
-      autoPlay: true,
+    _controller = VideoPlayerController.networkUrl(
+      Uri.parse(widget.streamUrl),
+      httpHeaders: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 VLC/3.0.16',
+      },
     );
+
+    _controller.initialize().then((_) {
+      if (mounted) {
+        setState(() => _hasError = false);
+        _controller.play();
+      }
+    }).catchError((error) {
+      if (mounted) {
+        setState(() => _hasError = true);
+      }
+    });
 
     Future.delayed(const Duration(seconds: 4), () {
       if (mounted) setState(() => _showControls = false);
@@ -455,7 +462,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   @override
   void dispose() {
-    _vlcViewController.dispose();
+    _controller.dispose();
     super.dispose();
   }
 
@@ -466,13 +473,20 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       child: Stack(
         children: [
           Positioned.fill(
-            child: VlcPlayer(
-              controller: _vlcViewController,
-              aspectRatio: 16 / 9,
-              placeholder: const Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
-            ),
+            child: _hasError
+                ? const Center(child: Icon(Icons.error_outline, color: ShroudyColors.primaryRed, size: 42))
+                : _controller.value.isInitialized
+                    ? FittedBox(
+                        fit: BoxFit.fill,
+                        child: SizedBox(
+                          width: _controller.value.size.width,
+                          height: _controller.value.size.height,
+                          child: VideoPlayer(_controller),
+                        ),
+                      )
+                    : const Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
           ),
-          if (_showControls)
+          if (_showControls && !_hasError)
             Positioned.fill(
               child: Container(
                 decoration: const BoxDecoration(
@@ -491,22 +505,22 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       children: [
                         IconButton(icon: const Icon(Icons.close, color: Colors.white), onPressed: widget.onClose),
                         Text(widget.channelName, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                        IconButton(
-                          icon: Icon(widget.isFavorited ? Icons.star : Icons.star_border, color: widget.isFavorited ? ShroudyColors.goldText : Colors.white), 
-                          onPressed: widget.onFavToggle
+                                                IconButton(
+                          icon: Icon(
+                            widget.isFavorited ? Icons.star : Icons.star_border,
+                            color: widget.isFavorited ? ShroudyColors.goldText : Colors.white,
+                          ),
+                          onPressed: widget.onFavToggle,
                         ),
                       ],
                     ),
                     IconButton(
-                      icon: Icon(_vlcViewController.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 48),
-                      onPressed: () async {
-                                                if (_vlcViewController.value.isPlaying) {
-                          await _vlcViewController.pause();
-                        } else {
-                          await _vlcViewController.play();
-                        }
-                        setState(() {});
-                      },
+                      icon: Icon(
+                        _controller.value.isPlaying ? Icons.pause : Icons.play_arrow,
+                        color: Colors.white,
+                        size: 48,
+                      ),
+                      onPressed: () => setState(() => _controller.value.isPlaying ? _controller.pause() : _controller.play()),
                     ),
                     const SizedBox(height: 20),
                   ],
@@ -523,4 +537,3 @@ class BorderBorder extends Border {
   const BorderBorder({required BorderSide side, double width = 1.0})
       : super(top: side, bottom: side, left: side, right: side);
 }
-
