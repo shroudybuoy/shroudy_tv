@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1304,12 +1303,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
 
-  // Decoded frame size reported by VLC. Used to force the picture to fill the
-  // player box ourselves, because on iOS MobileVLCKit renders through its own
-  // layer and ignores the native `fit`/contentMode the plugin sets — so odd
-  // aspect-ratio channels would otherwise stay letterboxed no matter what.
-  Size? _videoSize;
-
   List<VlcTrackDescription> _audioTracks = [];
   List<VlcTrackDescription> _subtitleTracks = [];
 
@@ -1349,7 +1342,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _controller.dispose();
       _tracksLoaded = false;
       _errorText = null;
-      _videoSize = null;
       _selectedAudioTrackId = null;
       _selectedSubtitleTrackId = null;
       _audioTracks = [];
@@ -1406,13 +1398,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     if (_isPlaying != playing) {
       _isPlaying = playing;
       _playingNotifier.value = playing;
-      setState(() {});
-    }
-
-    // Track the decoded frame size so _buildVideoWidget can force the picture
-    // to fill the box. Only rebuild when it actually changes (once per stream).
-    if (value.videoSize != _videoSize) {
-      _videoSize = value.videoSize;
       setState(() {});
     }
 
@@ -1714,17 +1699,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-  Widget _buildVideoWidget() {
-    // Force the native side to `contain` so the picture letterboxes
-    // predictably inside the platform view on every platform. We then do the
-    // fill/crop ourselves with pure layout (an oversized box + clip). This is
-    // necessary because on iOS MobileVLCKit renders through its own layer and
-    // ignores the `fit`/contentMode the plugin sets, so channels whose source
-    // aspect ratio differs from the box would stay letterboxed forever.
+  Widget _buildVideoWidget(VlcVideoFit fit) {
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: VlcVideoFit.contain,
+      fit: fit,
     );
 
     switch (_selectedAspectRatio) {
@@ -1732,65 +1711,19 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         return Center(
           child: AspectRatio(
             aspectRatio: 16 / 9,
-            child: _coverFill(player),
+            child: ClipRect(child: player),
           ),
         );
       case '4:3':
         return Center(
           child: AspectRatio(
             aspectRatio: 4 / 3,
-            child: _coverFill(player),
+            child: ClipRect(child: player),
           ),
         );
       default:
-        return Positioned.fill(child: _coverFill(player));
+        return Positioned.fill(child: player);
     }
-  }
-
-  // Scales the video so it completely covers the available box, cropping any
-  // overflow while preserving the source aspect ratio (no distortion). Uses an
-  // oversized, centered box clipped to the target rect rather than a paint
-  // transform, because transforms on platform views are unreliable.
-  Widget _coverFill(Widget player) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final boxW = constraints.maxWidth;
-        final boxH = constraints.maxHeight;
-        final video = _videoSize;
-
-        if (!boxW.isFinite ||
-            !boxH.isFinite ||
-            boxW <= 0 ||
-            boxH <= 0 ||
-            video == null ||
-            video.width <= 0 ||
-            video.height <= 0) {
-          // VLC has not reported the frame size yet. Fill the box; native
-          // `contain` letterboxes for the brief moment until it arrives.
-          return ClipRect(child: SizedBox.expand(child: player));
-        }
-
-        // Smallest uniform scale that covers the whole box.
-        final scale = math.max(boxW / video.width, boxH / video.height);
-        final drawW = video.width * scale;
-        final drawH = video.height * scale;
-
-        return ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.center,
-            minWidth: 0,
-            minHeight: 0,
-            maxWidth: double.infinity,
-            maxHeight: double.infinity,
-            child: SizedBox(
-              width: drawW,
-              height: drawH,
-              child: player,
-            ),
-          ),
-        );
-      },
-    );
   }
 
   @override
@@ -1801,8 +1734,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       fit: StackFit.expand,
       children: [
         // VLC video. The selected aspect ratio changes the actual widget
-        // bounds; _coverFill then forces the picture to fill that box.
-        _buildVideoWidget(),
+        // bounds instead of merely cropping the source.
+        _buildVideoWidget(_currentFit),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
