@@ -1472,11 +1472,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
     try {
-      // playOrPause() is a single native command that toggles based on VLC's
-      // own playback state. Separate play()/pause() calls driven by an
-      // optimistic local flag desync from the native listener on live
-      // streams, which is why the icon would flip back immediately.
-      await _controller.playOrPause();
+      // VlcPlayerController exposes separate play and pause commands. Use
+      // VLC's current state rather than an optimistic local toggle.
+      if (_controller.value.isPlaying) {
+        await _controller.pause();
+      } else {
+        await _controller.play();
+      }
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
     }
