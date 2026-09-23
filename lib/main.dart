@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -780,6 +779,18 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
 
+  // Leaves the player: runs an orderly, awaited native teardown (stop VLC, then
+  // release the shared audio session) BEFORE the widget unmounts, so the iOS
+  // main thread is never left tearing down a live audio session mid-frame.
+  Future<void> _closePlayer() async {
+    final playerState =
+        _playerKey.currentState as _VideoCanvasPlayerLayerState?;
+    await playerState?.shutdown();
+    if (!mounted) return;
+    _setPlayerFullscreen(false);
+    setState(() => _currentChannel = null);
+  }
+
   // Single widget instance reused by both the split view and the fullscreen
   // body. The stable GlobalKey is what lets Flutter reparent the Element
   // (and its underlying VLC platform view) between the two layouts without
@@ -794,10 +805,7 @@ class _MainDashboardState extends State<MainDashboard> {
       isFavorited: _favoritesList.contains(channel.name),
       isFullscreen: isFullscreen,
       onFavToggle: () => _toggleFavorite(channel.name),
-      onClose: () {
-        _setPlayerFullscreen(false);
-        setState(() => _currentChannel = null);
-      },
+      onClose: _closePlayer,
       onFullscreenChanged: _setPlayerFullscreen,
       onPrevious: _playPreviousChannel,
       onNext: _playNextChannel,
@@ -1314,7 +1322,7 @@ class _MainDashboardState extends State<MainDashboard> {
               ),
               const SizedBox(width: 16),
               ElevatedButton(
-                onPressed: () => setState(() => _currentChannel = null),
+                onPressed: _closePlayer,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: ShroudyColors.cardNavyBg,
                   side: const BorderSide(color: ShroudyColors.accentBorder, width: 1.5),
@@ -1881,17 +1889,57 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _showControlsTemporarily();
   }
 
+  // True once shutdown() has torn down the native audio/VLC resources. dispose()
+  // checks this so it does not repeat (and race) the same native calls.
+  bool _shutDown = false;
+
+  // Orderly teardown, awaited BEFORE the widget is unmounted. VLC and
+  // flutter_volume_controller share the single iOS AVAudioSession; the volume
+  // plugin's onCancel calls setActive(false), which deadlocks the main thread
+  // if VLC's audio unit is still running. So we stop VLC first (releasing the
+  // session), await it, and only then cancel the volume listener.
+  Future<void> shutdown() async {
+    if (_shutDown) return;
+    _shutDown = true;
+    _controlsTimer?.cancel();
+    _controlsTimer = null;
+    try {
+      await _controller.stop();
+    } catch (e) {
+      debugPrint('shutdown stop: $e');
+    }
+    await _volumeSubscription?.cancel();
+    _volumeSubscription = null;
+    FlutterVolumeController.removeListener();
+    try {
+      await FlutterVolumeController.updateShowSystemUI(true);
+    } catch (e) {
+      debugPrint('shutdown updateShowSystemUI: $e');
+    }
+    try {
+      await ScreenBrightness.instance.resetApplicationScreenBrightness();
+    } catch (e) {
+      debugPrint('shutdown resetBrightness: $e');
+    }
+  }
+
   @override
   void dispose() {
     _controlsTimer?.cancel();
-    // Restore the pre-player screen brightness so closing the video does
-    // not leave the whole app dimmed or blown out.
-    ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
-      (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
-    );
-    _volumeSubscription?.cancel();
-    FlutterVolumeController.removeListener();
-    FlutterVolumeController.updateShowSystemUI(true);
+    if (!_shutDown) {
+      // Fallback for the rare path where the widget is removed without an
+      // awaited shutdown(). Stop VLC before touching the shared audio session
+      // so the volume plugin's setActive(false) never races a live audio unit.
+      unawaited(_controller.stop().catchError(
+        (Object e) => debugPrint('dispose stop: $e'),
+      ));
+      _volumeSubscription?.cancel();
+      FlutterVolumeController.removeListener();
+      FlutterVolumeController.updateShowSystemUI(true);
+      ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
+        (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
+      );
+    }
     _fitNotifier.dispose();
     _aspectNotifier.dispose();
     _playingNotifier.dispose();
