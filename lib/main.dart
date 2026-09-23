@@ -215,11 +215,17 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   String _normalizeEpgName(String value) {
-    return value
-        .toLowerCase()
-        .replaceAll(RegExp(r'&amp;|&#38;'), '&')
-        .replaceAll(RegExp(r'[^a-z0-9]+'), '')
-        .replaceAll(RegExp(r'hd|sd|fhd|uhd'), '');
+    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
+    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
+    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
+  }
+
+  String _epgNameKey(String value) {
+    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
+    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
+    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
   }
 
   String _decodeXmlText(String value) {
@@ -298,76 +304,68 @@ class _MainDashboardState extends State<MainDashboard> {
         final now = DateTime.now();
         final result = <String, EpgData>{};
 
-        // Primary match: M3U tvg-id == XMLTV programme channel id.
-        // This is the reliable mapping for playlists such as
-        // SonyEntertainmentTelevision.in@HD -> SonyEntertainmentTelevision.in@HD.
-        for (final channel in _allChannelsList) {
-          final id = channel.tvgId.trim();
-          if (id.isEmpty) continue;
-
-          final list = programmes[id];
-          if (list == null || list.isEmpty) continue;
-
-          list.sort((a, b) => a.start.compareTo(b.start));
+        EpgData? pickEpg(List<EpgProgram>? source) {
+          if (source == null || source.isEmpty) return null;
+          source.sort((a, b) => a.start.compareTo(b.start));
           EpgProgram? current;
           EpgProgram? next;
-          for (final program in list) {
+          for (final program in source) {
             if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
               current = program;
-              continue;
-            }
-            if (program.start.isAfter(now)) {
+            } else if (program.start.isAfter(now)) {
               next = program;
               break;
             }
           }
-
-          if (current != null || next != null) {
-            result[channel.tvgId] = EpgData(now: current, next: next);
-          }
+          if (current == null && next == null) return null;
+          return EpgData(now: current, next: next);
         }
 
-        // Only use display-name matching as a fallback for playlist entries
-        // that do not provide tvg-id. Never override an exact tvg-id match.
-        if (result.length < _allChannelsList.where((c) => c.tvgId.isNotEmpty).length) {
-          final byName = <String, List<EpgProgram>>{};
-          programmes.forEach((id, list) {
-            final display = channelNames[id];
-            if (display == null) return;
-            final key = _normalizeEpgName(display);
-            if (key.isNotEmpty) byName[key] = list;
-          });
-
-          for (final channel in _allChannelsList.where((c) => c.tvgId.isEmpty)) {
-            final key = _normalizeEpgName(channel.name);
-            List<EpgProgram>? list = byName[key];
-            if (list == null) {
-              for (final entry in byName.entries) {
-                if (entry.key == key || entry.key.contains(key) || key.contains(entry.key)) {
-                  list = entry.value;
-                  break;
-                }
-              }
-            }
-            if (list == null) continue;
-            list.sort((a, b) => a.start.compareTo(b.start));
-            EpgProgram? current;
-            EpgProgram? next;
-            for (final program in list) {
-              if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
-                current = program;
-                continue;
-              }
-              if (program.start.isAfter(now)) {
-                next = program;
+        // First: exact M3U tvg-id == XMLTV channel id.
+        for (final channel in _allChannelsList) {
+          final id = channel.tvgId.trim();
+          if (id.isEmpty) continue;
+          EpgData? data = pickEpg(programmes[id]);
+          if (data == null) {
+            for (final entry in programmes.entries) {
+              if (entry.key.toLowerCase() == id.toLowerCase()) {
+                data = pickEpg(entry.value);
                 break;
               }
             }
-            if (current != null || next != null) {
-              result[channel.tvgId.isEmpty ? channel.name : channel.tvgId] = EpgData(now: current, next: next);
+          }
+          if (data != null) result[id] = data;
+        }
+
+        // Second: name fallback for ALL channels. This is important for custom
+        // provider IDs such as ts56, which do not exist in XMLTV.
+        final byName = <String, List<EpgProgram>>{};
+        programmes.forEach((id, list) {
+          final display = channelNames[id];
+          if (display == null || display.trim().isEmpty) return;
+          final key = _epgNameKey(display);
+          if (key.isNotEmpty) byName[key] = list;
+        });
+
+        for (final channel in _allChannelsList) {
+          final resultKey = channel.tvgId.trim().isNotEmpty ? channel.tvgId.trim() : channel.name;
+          if (result.containsKey(resultKey)) continue;
+
+          final channelKey = _epgNameKey(channel.name);
+          List<EpgProgram>? list = byName[channelKey];
+          if (list == null && channelKey.isNotEmpty) {
+            for (final entry in byName.entries) {
+              if (entry.key == channelKey || entry.key.contains(channelKey) || channelKey.contains(entry.key)) {
+                list = entry.value;
+                break;
+              }
             }
           }
+          final data = pickEpg(list);
+          if (data != null) result[resultKey] = data;
         }
+
+        debugPrint('EPG parsed: ${programmes.length} XMLTV channel IDs, ${result.length} matched playlist channels from $url');
 
         if (mounted) {
           setState(() {
