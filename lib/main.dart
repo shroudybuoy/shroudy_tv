@@ -1381,12 +1381,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   void _createController(String url) {
     _controller = VlcPlayerController(
-      // Sharpen enhances edges on soft/low-bitrate streams. It cannot add real
-      // detail, but a light sigma noticeably crisps up fuzzy video.
-      options: const [
-        '--video-filter=sharpen',
-        '--sharpen-sigma=0.08',
-      ],
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
         mediaOptions: const [
