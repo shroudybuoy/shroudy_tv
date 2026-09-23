@@ -25,6 +25,11 @@ dependencies:
   screen_brightness_android: ^2.1.3
   screen_brightness_ios: ^2.1.3
 
+  # Real device (system) volume control for the right-side vertical drag
+  # gesture. On iOS this drives the hardware volume via MPVolumeView so the
+  # gesture stays in sync with the physical buttons.
+  flutter_volume_controller: ^2.0.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
