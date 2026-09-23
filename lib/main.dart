@@ -805,9 +805,9 @@ class _MainDashboardState extends State<MainDashboard> {
           ),
           const SizedBox(height: 18),
           const Text(
-            'EPG • PROGRAMME GUIDE',
+            'PROGRAMME GUIDE',
             style: TextStyle(
-              color: ShroudyColors.primaryRed,
+              color: Color.fromARGB(255, 71, 24, 243),
               fontSize: 11,
               fontWeight: FontWeight.bold,
             ),
@@ -890,7 +890,7 @@ class _MainDashboardState extends State<MainDashboard> {
           const Text(
             'LIVE NOW',
             style: TextStyle(
-              color: Colors.greenAccent,
+              color: Color.fromARGB(255, 241, 59, 4),
               fontSize: 11,
               fontWeight: FontWeight.bold,
             ),
@@ -1062,8 +1062,8 @@ class _MainDashboardState extends State<MainDashboard> {
             children: [
               Expanded(
                 child: Text(
-                  'NOW PLAYING: ${_currentChannel!.name.toUpperCase()}',
-                  style: const TextStyle(color: ShroudyColors.primaryRed, fontSize: 20, fontWeight: FontWeight.bold),
+                  'PLAYING: ${_currentChannel!.name.toUpperCase()}',
+                  style: const TextStyle(color: Color.fromARGB(255, 233, 68, 239), fontSize: 20, fontWeight: FontWeight.bold),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -1121,7 +1121,7 @@ class _MainDashboardState extends State<MainDashboard> {
         ),
         const Padding(
           padding: EdgeInsets.only(left: 24, top: 16, bottom: 8),
-          child: Align(alignment: Alignment.centerLeft, child: Text('★ CHANNELS FROM SAME CATEGORY', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold))),
+          child: Align(alignment: Alignment.centerLeft, child: Text('★ CHANNELS FROM SAME CATEGORY', style: TextStyle(color: Color.fromARGB(255, 248, 203, 1), fontSize: 13, fontWeight: FontWeight.bold))),
         ),
         Expanded(
           flex: 1,
