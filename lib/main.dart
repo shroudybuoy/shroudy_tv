@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -74,6 +75,220 @@ class EpgData {
   });
 }
 
+/// In-memory cache of channel logo bytes that lives for the whole app session.
+/// Logos are downloaded once and reused from RAM (as compressed bytes, which is
+/// far cheaper than a decoded-image cache) until the process exits — i.e. until
+/// the user closes the app. Nothing is written to disk.
+class _LogoCache {
+  static final Map<String, Uint8List> _bytes = <String, Uint8List>{};
+  static final Map<String, Future<Uint8List?>> _inFlight =
+      <String, Future<Uint8List?>>{};
+
+  static Future<Uint8List?> load(String url) {
+    final key = url.trim();
+    if (key.isEmpty) return Future.value(null);
+
+    final cached = _bytes[key];
+    if (cached != null) return Future.value(cached);
+
+    final pending = _inFlight[key];
+    if (pending != null) return pending;
+
+    final future = http.get(Uri.parse(key)).then<Uint8List?>((res) {
+      _inFlight.remove(key);
+      if (res.statusCode == 200 && res.bodyBytes.isNotEmpty) {
+        _bytes[key] = res.bodyBytes;
+        return res.bodyBytes;
+      }
+      return null;
+    }).catchError((Object e) {
+      _inFlight.remove(key);
+      debugPrint('Logo fetch failed for $key: $e');
+      return null;
+    });
+    _inFlight[key] = future;
+    return future;
+  }
+}
+
+/// Renders a channel logo from the session cache. Falls back to [fallback] while
+/// loading or if the URL is empty/unreachable.
+class SessionLogo extends StatefulWidget {
+  final String url;
+  final double? width;
+  final double? height;
+  final BoxFit fit;
+  final Widget fallback;
+
+  const SessionLogo({
+    super.key,
+    required this.url,
+    this.width,
+    this.height,
+    this.fit = BoxFit.contain,
+    this.fallback = const Icon(Icons.tv, color: Colors.white),
+  });
+
+  @override
+  State<SessionLogo> createState() => _SessionLogoState();
+}
+
+class _SessionLogoState extends State<SessionLogo> {
+  Uint8List? _bytes;
+
+  @override
+  void initState() {
+    super.initState();
+    _load(widget.url);
+  }
+
+  @override
+  void didUpdateWidget(SessionLogo oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.url != widget.url) _load(widget.url);
+  }
+
+  Future<void> _load(String url) async {
+    final bytes = await _LogoCache.load(url);
+    if (!mounted || bytes == null) return;
+    setState(() => _bytes = bytes);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = _bytes;
+    if (bytes == null) return widget.fallback;
+    return Image.memory(
+      bytes,
+      width: widget.width,
+      height: widget.height,
+      fit: widget.fit,
+      gaplessPlayback: true,
+      errorBuilder: (_, _, _) => widget.fallback,
+    );
+  }
+}
+
+/// Animated boot/splash screen shown while the playlist and channel logos load.
+class BootSplash extends StatefulWidget {
+  const BootSplash({super.key});
+
+  @override
+  State<BootSplash> createState() => _BootSplashState();
+}
+
+class _BootSplashState extends State<BootSplash> with TickerProviderStateMixin {
+  // Gentle "breathing" pulse on the logo badge.
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1300),
+  )..repeat(reverse: true);
+
+  // One-shot entrance for the whole composition.
+  late final AnimationController _entrance = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    _entrance.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fade = CurvedAnimation(parent: _entrance, curve: Curves.easeOut);
+    final rise = Tween<Offset>(
+      begin: const Offset(0, 0.12),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _entrance, curve: Curves.easeOutCubic));
+    final scale = Tween<double>(begin: 0.86, end: 1.0).animate(
+      CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+    );
+
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [ShroudyColors.darkNavyBg, ShroudyColors.cardNavyBg],
+          ),
+        ),
+        child: Center(
+          child: FadeTransition(
+            opacity: fade,
+            child: SlideTransition(
+              position: rise,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ScaleTransition(
+                    scale: scale,
+                    child: Container(
+                      width: 96,
+                      height: 96,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [ShroudyColors.primaryRed, Color(0xFFB91C1C)],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: ShroudyColors.primaryRed.withAlpha(115),
+                            blurRadius: 34,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(Icons.live_tv, color: Colors.white, size: 46),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  const Text(
+                    'SHROUDY TV',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 6,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'i P a d',
+                    style: TextStyle(
+                      color: Colors.white.withAlpha(150),
+                      fontSize: 13,
+                      letterSpacing: 4,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 36),
+                  SizedBox(
+                    width: 150,
+                    child: LinearProgressIndicator(
+                      minHeight: 3,
+                      backgroundColor: Colors.white.withAlpha(30),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        ShroudyColors.primaryRed,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ShroudyTvApp extends StatelessWidget {
   const ShroudyTvApp({super.key});
 
@@ -110,6 +325,11 @@ class _MainDashboardState extends State<MainDashboard> {
   Timer? _epgRefreshTimer;
   String? _playlistEpgUrl;
 
+  // Boot splash timing: keep it on screen for at least _minBootDuration so the
+  // animation plays out even when the playlist loads almost instantly.
+  final DateTime _bootStart = DateTime.now();
+  static const Duration _minBootDuration = Duration(milliseconds: 2200);
+
   // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
   // that toggling it only changes the layout around the player. The player
   // widget itself is kept alive via _playerKey across the transition, which
@@ -123,6 +343,14 @@ class _MainDashboardState extends State<MainDashboard> {
     super.initState();
     _fetchM3uPlaylist();
     _epgRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) => _refreshCurrentEpg());
+  }
+
+  // Waits out the remaining minimum boot time (if any), then reveals the UI.
+  Future<void> _finishBoot() async {
+    final remaining = _minBootDuration - DateTime.now().difference(_bootStart);
+    if (remaining > Duration.zero) await Future.delayed(remaining);
+    if (!mounted) return;
+    setState(() => _isLoading = false);
   }
 
   Future<void> _fetchM3uPlaylist() async {
@@ -196,15 +424,15 @@ class _MainDashboardState extends State<MainDashboard> {
         setState(() {
           _favoritesList.addAll(savedFavs);
           _categoriesList.addAll(categoriesSet.toList()..sort());
-          _isLoading = false;
         });
         _fetchEpg();
+        await _finishBoot();
       } else {
-        if (mounted) setState(() => _isLoading = false);
+        await _finishBoot();
       }
     } catch (e) {
       debugPrint('Playlist error: $e');
-      if (mounted) setState(() => _isLoading = false);
+      await _finishBoot();
     }
   }
 
@@ -665,14 +893,28 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   List<ChannelItem> _getFilteredChannels() {
-    return _allChannelsList.where((ch) {
-      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
-      if (_selectedCategory == '★ Favorites') {
-        return _favoritesList.contains(ch.name) && matchesSearch;
-      }
-      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
-      return matchesCat && matchesSearch;
-    }).toList();
+    final query = _searchQuery.trim().toLowerCase();
+    bool matchesSearch(ChannelItem ch) =>
+        query.isEmpty || ch.name.toLowerCase().contains(query);
+
+    // The Favorites tab stays scoped to favorites even while searching.
+    if (_selectedCategory == '★ Favorites') {
+      return _allChannelsList
+          .where((ch) => _favoritesList.contains(ch.name) && matchesSearch(ch))
+          .toList();
+    }
+
+    // A non-empty search is global: it spans every category, not just the
+    // selected tab, so a channel is found no matter which category it lives in.
+    if (query.isNotEmpty) {
+      return _allChannelsList.where(matchesSearch).toList();
+    }
+
+    // No search: fall back to the selected category (or all).
+    return _allChannelsList
+        .where((ch) =>
+            _selectedCategory == 'All' || ch.category == _selectedCategory)
+        .toList();
   }
 
   // Switches to the previous/next channel within the list the user is
@@ -702,9 +944,7 @@ class _MainDashboardState extends State<MainDashboard> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
-      );
+      return const BootSplash();
     }
 
     final filteredChannels = _getFilteredChannels();
@@ -821,10 +1061,10 @@ class _MainDashboardState extends State<MainDashboard> {
                 child: Container(
                   color: ShroudyColors.innerLogoBg,
                   width: double.infinity,
-                  child: Image.network(
-                    channel.logoUrl,
+                  child: SessionLogo(
+                    url: channel.logoUrl,
                     fit: BoxFit.contain,
-                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
+                    fallback: const Icon(Icons.tv, color: Colors.white),
                   ),
                 ),
               ),
@@ -871,11 +1111,10 @@ class _MainDashboardState extends State<MainDashboard> {
               ),
               child: channel.logoUrl.trim().isEmpty
                   ? const Icon(Icons.tv, color: Colors.white, size: 34)
-                  : Image.network(
-                      channel.logoUrl,
+                  : SessionLogo(
+                      url: channel.logoUrl,
                       fit: BoxFit.contain,
-                      errorBuilder: (_, __, ___) =>
-                          const Icon(Icons.tv, color: Colors.white, size: 34),
+                      fallback: const Icon(Icons.tv, color: Colors.white, size: 34),
                     ),
             ),
           ),
@@ -1239,10 +1478,10 @@ class _MainDashboardState extends State<MainDashboard> {
                                   child: Container(
                                     color: ShroudyColors.innerLogoBg,
                                     width: double.infinity,
-                                    child: Image.network(
-                                      relChannel.logoUrl,
+                                    child: SessionLogo(
+                                      url: relChannel.logoUrl,
                                       fit: BoxFit.contain,
-                                      errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
+                                      fallback: const Icon(Icons.tv, color: Colors.white),
                                     ),
                                   ),
                                 ),
