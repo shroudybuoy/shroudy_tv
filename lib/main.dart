@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:http/http.dart' as http;
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -1314,11 +1315,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late final ValueNotifier<String> _aspectNotifier;
 
   // Shared gesture state so the normal and fullscreen views stay in sync.
-  // Volume goes through VLC (0..100). Brightness is applied through the
+  // Volume controls the real iOS device volume (0..100) via
+  // `flutter_volume_controller`. Brightness is applied through the
   // `screen_brightness` plugin using the app-scoped setter, so it does not
   // modify the system-wide brightness setting.
   final ValueNotifier<int> _volumeNotifier = ValueNotifier<int>(100);
   final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
+  StreamSubscription<double>? _volumeSubscription;
 
   @override
   void initState() {
@@ -1328,6 +1331,21 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _createController(widget.streamUrl);
     _showControlsTemporarily();
     _syncInitialBrightness();
+    _syncInitialVolume();
+  }
+
+  void _syncInitialVolume() {
+    // Hide the native volume HUD so our own overlay indicator is the only one.
+    FlutterVolumeController.updateShowSystemUI(false);
+    // emitOnStart seeds the notifier with the device's current volume and then
+    // keeps it in sync if the user changes volume with the physical buttons.
+    _volumeSubscription = FlutterVolumeController.addListener(
+      (volume) {
+        if (!mounted) return;
+        _volumeNotifier.value = (volume.clamp(0.0, 1.0) * 100).round();
+      },
+      emitOnStart: true,
+    );
   }
 
   @override
@@ -1363,6 +1381,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   void _createController(String url) {
     _controller = VlcPlayerController(
+      // Sharpen enhances edges on soft/low-bitrate streams. It cannot add real
+      // detail, but a light sigma noticeably crisps up fuzzy video.
+      options: const [
+        '--video-filter=sharpen',
+        '--sharpen-sigma=0.08',
+      ],
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
         mediaOptions: const [
@@ -1689,6 +1713,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
       (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
     );
+    _volumeSubscription?.cancel();
+    FlutterVolumeController.removeListener();
+    FlutterVolumeController.updateShowSystemUI(true);
     _fitNotifier.dispose();
     _aspectNotifier.dispose();
     _playingNotifier.dispose();
@@ -1739,9 +1766,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
-          controller: _controller,
           volumeNotifier: _volumeNotifier,
           brightnessNotifier: _brightnessNotifier,
+          onActivity: _showControlsTemporarily,
         ),
 
         // Transparent touch layer ABOVE the video. This is deliberate:
@@ -1906,16 +1933,18 @@ enum _GestureSide { volume, brightness }
 /// Transparent overlay that turns vertical drags on the left half of the
 /// video into brightness changes (via the `screen_brightness` plugin, which
 /// is app-scoped so it does not touch the system-wide setting) and vertical
-/// drags on the right half into VLC volume changes.
+/// drags on the right half into device volume changes.
 class _VideoGestureLayer extends StatefulWidget {
-  final VlcPlayerController controller;
   final ValueNotifier<int> volumeNotifier;
   final ValueNotifier<double> brightnessNotifier;
+  // Called on gesture activity so the parent can reveal its own controls and
+  // keep both the indicators and the player chrome on the same hide schedule.
+  final VoidCallback onActivity;
 
   const _VideoGestureLayer({
-    required this.controller,
     required this.volumeNotifier,
     required this.brightnessNotifier,
+    required this.onActivity,
   });
 
   @override
@@ -1943,6 +1972,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
 
   void _onStart(DragStartDetails d, _GestureSide side) {
     _hideTimer?.cancel();
+    widget.onActivity();
     final sideChanged = _activeSide != side;
     _activeSide = side;
     _startY = d.globalPosition.dy;
@@ -1980,6 +2010,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
     }
 
     _hideTimer?.cancel();
+    widget.onActivity();
     if (!_showIndicator) setState(() => _showIndicator = true);
   }
 
@@ -1989,7 +2020,9 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
       return;
     }
     _volumeCallInFlight = true;
-    widget.controller.setVolume(v).then(
+    // Drive the real iOS device volume (0.0..1.0) instead of VLC's internal
+    // volume, so the gesture matches the hardware buttons and the system mixer.
+    FlutterVolumeController.setVolume((v / 100).clamp(0.0, 1.0)).then(
       (_) {
         _volumeCallInFlight = false;
         final pending = _pendingVolume;
@@ -1997,7 +2030,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
         if (pending != null && pending != v && mounted) _requestVolume(pending);
       },
       onError: (Object e) {
-        debugPrint('VLC setVolume error: $e');
+        debugPrint('Device setVolume error: $e');
         _volumeCallInFlight = false;
         _pendingVolume = null;
       },
@@ -2029,7 +2062,10 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
 
   void _onEnd(DragEndDetails d, _GestureSide side) {
     _hideTimer?.cancel();
-    _hideTimer = Timer(const Duration(milliseconds: 800), () {
+    // Match the player chrome's 4s auto-hide so the brightness/volume
+    // indicator disappears together with the other controls instead of
+    // vanishing on its own shorter timer.
+    _hideTimer = Timer(const Duration(seconds: 4), () {
       if (!mounted) return;
       setState(() {
         _activeSide = null;
