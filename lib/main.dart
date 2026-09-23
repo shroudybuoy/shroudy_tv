@@ -989,8 +989,9 @@ class _MainDashboardState extends State<MainDashboard> {
           if (imageUrl.isNotEmpty)
             ClipRRect(
               borderRadius: BorderRadius.circular(7),
-              child: AspectRatio(
-                aspectRatio: 16 / 9,
+              child: SizedBox(
+                width: double.infinity,
+                height: 150,
                 child: Image.network(
                   imageUrl,
                   fit: BoxFit.cover,
@@ -1475,18 +1476,28 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
     try {
-      // vlc_player 2.1.2 has no playOrPause(); branch on VLC's real playback
-      // state rather than an optimistic local flag. Reading value.isPlaying
-      // keeps the toggle in sync with the native listener on live streams,
-      // which is what stops the icon from flipping straight back.
-      if (_controller.value.isPlaying) {
-        await _controller.pause();
-      } else {
+      // vlc_player 2.1.2 has no playOrPause(). On live streams VLC spends a lot
+      // of time in opening/buffering rather than the strict `playing` state, so
+      // branching on value.isPlaying made every tap call play() (a no-op) and
+      // pause appeared dead. Instead: only resume when actually paused/stopped,
+      // otherwise pause. This is the single source of truth the icon also uses.
+      if (_isPausedState(_controller.value.state)) {
         await _controller.play();
+      } else {
+        await _controller.pause();
       }
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
     }
+  }
+
+  // True only for states where playback is NOT active, i.e. tapping should
+  // resume. opening/buffering/playing all count as "active" so we pause them.
+  static bool _isPausedState(VlcPlaybackState state) {
+    return state == VlcPlaybackState.paused ||
+        state == VlcPlaybackState.stopped ||
+        state == VlcPlaybackState.ended ||
+        state == VlcPlaybackState.idle;
   }
 
   void _toggleFullscreen() {
@@ -1837,33 +1848,49 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                 Padding(
                   padding: const EdgeInsets.only(bottom: 16),
                   child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
+                      // LEFT: previous / play-pause / next
                       _playerIconButton(
                         icon: Icons.skip_previous,
                         tooltip: 'Previous Channel',
                         onPressed: widget.onPrevious,
                       ),
-                      _playerIconButton(
-                        icon: _isPlaying ? Icons.pause : Icons.play_arrow,
-                        tooltip: _isPlaying ? 'Pause' : 'Play',
-                        onPressed: _togglePlayPause,
+                      // Icon reads the controller's live state directly so it
+                      // can never disagree with what _togglePlayPause does.
+                      ValueListenableBuilder<VlcPlayerValue>(
+                        valueListenable: _controller,
+                        builder: (context, value, _) {
+                          final paused = _isPausedState(value.state);
+                          return _playerIconButton(
+                            icon: paused ? Icons.play_arrow : Icons.pause,
+                            tooltip: paused ? 'Play' : 'Pause',
+                            onPressed: _togglePlayPause,
+                          );
+                        },
                       ),
                       _playerIconButton(
                         icon: Icons.skip_next,
                         tooltip: 'Next Channel',
                         onPressed: widget.onNext,
                       ),
-                      _playerIconButton(
-                        icon: Icons.settings,
-                        tooltip: 'Player Settings',
-                        onPressed: _openPlayerSettingsDialog,
-                      ),
+
+                      const Spacer(),
+
+                      // MIDDLE: favorite
                       _playerIconButton(
                         icon: widget.isFavorited ? Icons.star : Icons.star_border,
                         tooltip: 'Favorite',
                         iconColor: widget.isFavorited ? ShroudyColors.goldText : Colors.white,
                         onPressed: widget.onFavToggle,
+                      ),
+
+                      const Spacer(),
+
+                      // RIGHT: settings / fullscreen
+                      _playerIconButton(
+                        icon: Icons.settings,
+                        tooltip: 'Player Settings',
+                        onPressed: _openPlayerSettingsDialog,
                       ),
                       _playerIconButton(
                         icon: widget.isFullscreen
