@@ -1224,6 +1224,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late final ValueNotifier<VlcVideoFit> _fitNotifier;
   late final ValueNotifier<String> _aspectNotifier;
 
+  // Shared gesture state so the normal and fullscreen views stay in sync.
+  // Volume goes through VLC (0..100). Brightness is a local dim overlay
+  // (0.15..1.0) so no native permission or plugin is required.
+  final ValueNotifier<int> _volumeNotifier = ValueNotifier<int>(100);
+  final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
+
   @override
   void initState() {
     super.initState();
@@ -1375,6 +1381,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
           fitNotifier: _fitNotifier,
           aspectNotifier: _aspectNotifier,
           isPlayingNotifier: _playingNotifier,
+          volumeNotifier: _volumeNotifier,
+          brightnessNotifier: _brightnessNotifier,
           isFavorited: widget.isFavorited,
           onFavToggle: widget.onFavToggle,
           onSettings: _openPlayerSettingsDialog,
@@ -1609,6 +1617,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _fitNotifier.dispose();
     _aspectNotifier.dispose();
     _playingNotifier.dispose();
+    _volumeNotifier.dispose();
+    _brightnessNotifier.dispose();
     _controller.removeListener(_playerListener);
     _controller.dispose();
     super.dispose();
@@ -1646,6 +1656,14 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // VLC video. The selected aspect ratio changes the actual widget
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
+
+        // Left/right vertical drag: brightness / volume. Also paints the
+        // dim overlay used to fake brightness reduction.
+        _VideoGestureLayer(
+          controller: _controller,
+          volumeNotifier: _volumeNotifier,
+          brightnessNotifier: _brightnessNotifier,
+        ),
 
         // Transparent touch layer ABOVE the video. This is deliberate:
         // touching anywhere on the video immediately reveals controls.
@@ -1777,6 +1795,8 @@ class _FullscreenVlcView extends StatefulWidget {
   final ValueNotifier<VlcVideoFit> fitNotifier;
   final ValueNotifier<String> aspectNotifier;
   final ValueNotifier<bool> isPlayingNotifier;
+  final ValueNotifier<int> volumeNotifier;
+  final ValueNotifier<double> brightnessNotifier;
   final bool isFavorited;
   final VoidCallback onFavToggle;
   final Future<void> Function() onSettings;
@@ -1790,6 +1810,8 @@ class _FullscreenVlcView extends StatefulWidget {
     required this.fitNotifier,
     required this.aspectNotifier,
     required this.isPlayingNotifier,
+    required this.volumeNotifier,
+    required this.brightnessNotifier,
     required this.isFavorited,
     required this.onFavToggle,
     required this.onSettings,
@@ -1858,6 +1880,14 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
                 builder: (_, fit, __) => _buildFullscreenVideo(fit, aspect),
               );
             },
+          ),
+
+          // Left/right vertical drag: brightness / volume (shared with the
+          // normal view via notifiers so state stays consistent).
+          _VideoGestureLayer(
+            controller: widget.controller,
+            volumeNotifier: widget.volumeNotifier,
+            brightnessNotifier: widget.brightnessNotifier,
           ),
 
           // This layer receives every touch on the video and never changes
@@ -1986,6 +2016,221 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
 
 extension on VlcPlayerValue {
   String? get errorMessage => null;
+}
+
+enum _GestureSide { volume, brightness }
+
+/// Transparent overlay that turns vertical drags on the left half of the
+/// video into brightness changes and vertical drags on the right half into
+/// volume changes. Also paints a black overlay whose alpha is derived from
+/// [brightnessNotifier], which is how brightness reduction is faked without
+/// needing a native screen-brightness plugin.
+class _VideoGestureLayer extends StatefulWidget {
+  final VlcPlayerController controller;
+  final ValueNotifier<int> volumeNotifier;
+  final ValueNotifier<double> brightnessNotifier;
+
+  const _VideoGestureLayer({
+    required this.controller,
+    required this.volumeNotifier,
+    required this.brightnessNotifier,
+  });
+
+  @override
+  State<_VideoGestureLayer> createState() => _VideoGestureLayerState();
+}
+
+class _VideoGestureLayerState extends State<_VideoGestureLayer> {
+  static const double _minBrightness = 0.15;
+  static const double _dragRangePx = 200.0;
+
+  _GestureSide? _activeSide;
+  double _startY = 0;
+  double _startValue = 0;
+  bool _showIndicator = false;
+  Timer? _hideTimer;
+
+  void _onStart(DragStartDetails d, _GestureSide side) {
+    _hideTimer?.cancel();
+    _activeSide = side;
+    _startY = d.globalPosition.dy;
+    _startValue = side == _GestureSide.volume
+        ? widget.volumeNotifier.value / 100.0
+        : widget.brightnessNotifier.value;
+    if (!_showIndicator) setState(() => _showIndicator = true);
+  }
+
+  void _onUpdate(DragUpdateDetails d, _GestureSide side) {
+    if (_activeSide != side) return;
+    // Dragging up increases the value; dragging down decreases it.
+    final delta = (_startY - d.globalPosition.dy) / _dragRangePx;
+
+    if (side == _GestureSide.volume) {
+      final next = ((_startValue + delta) * 100).round().clamp(0, 100);
+      if (next != widget.volumeNotifier.value) {
+        widget.volumeNotifier.value = next;
+        // Fire-and-forget: rapid drag updates should not queue up awaits.
+        widget.controller.setVolume(next).catchError((Object e) {
+          debugPrint('VLC setVolume error: $e');
+        });
+      }
+    } else {
+      final next = (_startValue + delta).clamp(_minBrightness, 1.0);
+      if (next != widget.brightnessNotifier.value) {
+        widget.brightnessNotifier.value = next;
+      }
+    }
+
+    if (!_showIndicator) setState(() => _showIndicator = true);
+    _hideTimer?.cancel();
+  }
+
+  void _onEnd(DragEndDetails d, _GestureSide side) {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(milliseconds: 800), () {
+      if (!mounted) return;
+      setState(() {
+        _activeSide = null;
+        _showIndicator = false;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ValueListenableBuilder<double>(
+          valueListenable: widget.brightnessNotifier,
+          builder: (_, b, __) {
+            final alpha = ((1.0 - b) * 255).round().clamp(0, 255);
+            return IgnorePointer(
+              child: ColoredBox(color: Colors.black.withAlpha(alpha)),
+            );
+          },
+        ),
+        Row(
+          children: [
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onVerticalDragStart: (d) => _onStart(d, _GestureSide.brightness),
+                onVerticalDragUpdate: (d) => _onUpdate(d, _GestureSide.brightness),
+                onVerticalDragEnd: (d) => _onEnd(d, _GestureSide.brightness),
+                onVerticalDragCancel: () {
+                  if (_activeSide == _GestureSide.brightness) {
+                    _onEnd(DragEndDetails(), _GestureSide.brightness);
+                  }
+                },
+              ),
+            ),
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onVerticalDragStart: (d) => _onStart(d, _GestureSide.volume),
+                onVerticalDragUpdate: (d) => _onUpdate(d, _GestureSide.volume),
+                onVerticalDragEnd: (d) => _onEnd(d, _GestureSide.volume),
+                onVerticalDragCancel: () {
+                  if (_activeSide == _GestureSide.volume) {
+                    _onEnd(DragEndDetails(), _GestureSide.volume);
+                  }
+                },
+              ),
+            ),
+          ],
+        ),
+        if (_showIndicator && _activeSide != null)
+          IgnorePointer(
+            child: Align(
+              alignment: _activeSide == _GestureSide.volume
+                  ? Alignment.centerRight
+                  : Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 28),
+                child: _buildIndicator(),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildIndicator() {
+    final isVolume = _activeSide == _GestureSide.volume;
+    final raw = isVolume
+        ? widget.volumeNotifier.value / 100.0
+        : (widget.brightnessNotifier.value - _minBrightness) / (1.0 - _minBrightness);
+    final fraction = raw.clamp(0.0, 1.0);
+
+    final int volValue = widget.volumeNotifier.value;
+    final IconData icon = isVolume
+        ? (volValue == 0
+            ? Icons.volume_off
+            : (volValue < 50 ? Icons.volume_down : Icons.volume_up))
+        : Icons.brightness_6;
+
+    final label = isVolume
+        ? '$volValue%'
+        : '${(widget.brightnessNotifier.value * 100).round()}%';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.black.withAlpha(170),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white, size: 26),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 100,
+            width: 6,
+            child: Stack(
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: FractionallySizedBox(
+                    heightFactor: fraction,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class BorderBorder extends Border {
