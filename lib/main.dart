@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:screen_brightness/screen_brightness.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vlc_player/vlc_player.dart';
 
@@ -107,6 +108,14 @@ class _MainDashboardState extends State<MainDashboard> {
   final Map<String, EpgData> _epgByChannel = {};
   Timer? _epgRefreshTimer;
   String? _playlistEpgUrl;
+
+  // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
+  // that toggling it only changes the layout around the player. The player
+  // widget itself is kept alive via _playerKey across the transition, which
+  // prevents VLC from tearing down its native surface and re-buffering the
+  // live stream.
+  bool _isPlayerFullscreen = false;
+  final GlobalKey _playerKey = GlobalKey();
 
   @override
   void initState() {
@@ -622,6 +631,36 @@ class _MainDashboardState extends State<MainDashboard> {
     await prefs.setStringList('favorite_names', _favoritesList);
   }
 
+  void _setPlayerFullscreen(bool value) {
+    if (_isPlayerFullscreen == value) return;
+    setState(() => _isPlayerFullscreen = value);
+    SystemChrome.setEnabledSystemUIMode(
+      value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
+  // Single widget instance reused by both the split view and the fullscreen
+  // body. The stable GlobalKey is what lets Flutter reparent the Element
+  // (and its underlying VLC platform view) between the two layouts without
+  // destroying and recreating it.
+  Widget _buildPlayer({required bool isFullscreen}) {
+    final channel = _currentChannel;
+    if (channel == null) return const SizedBox.shrink();
+    return VideoCanvasPlayerLayer(
+      key: _playerKey,
+      streamUrl: channel.streamUrl,
+      channelName: channel.name,
+      isFavorited: _favoritesList.contains(channel.name),
+      isFullscreen: isFullscreen,
+      onFavToggle: () => _toggleFavorite(channel.name),
+      onClose: () {
+        _setPlayerFullscreen(false);
+        setState(() => _currentChannel = null);
+      },
+      onFullscreenChanged: _setPlayerFullscreen,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -639,10 +678,30 @@ class _MainDashboardState extends State<MainDashboard> {
       return matchesCat && matchesSearch;
     }).toList();
 
-    return Scaffold(
-      body: _currentChannel != null
-          ? _buildPremiumSplitPlayerLayoutView(filteredChannels)
-          : _buildStandardBrowsingHubView(filteredChannels),
+    Widget body;
+    if (_currentChannel == null) {
+      body = _buildStandardBrowsingHubView(filteredChannels);
+    } else if (_isPlayerFullscreen) {
+      // Same widget instance (same GlobalKey) as inside the split view, so
+      // its Element — and the VLC platform view under it — is reparented
+      // rather than recreated. That is what keeps the live stream playing
+      // through the fullscreen transition.
+      body = ColoredBox(
+        color: Colors.black,
+        child: _buildPlayer(isFullscreen: true),
+      );
+    } else {
+      body = _buildPremiumSplitPlayerLayoutView(filteredChannels);
+    }
+
+    return PopScope(
+      canPop: !_isPlayerFullscreen,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && _isPlayerFullscreen) {
+          _setPlayerFullscreen(false);
+        }
+      },
+      child: Scaffold(body: body),
     );
   }
   Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
@@ -1093,14 +1152,7 @@ class _MainDashboardState extends State<MainDashboard> {
                   flex: 2,
                   child: Container(
                     color: Colors.black,
-                    child: VideoCanvasPlayerLayer(
-                      key: ValueKey(_currentChannel!.streamUrl),
-                      streamUrl: _currentChannel!.streamUrl,
-                      channelName: _currentChannel!.name,
-                      isFavorited: _favoritesList.contains(_currentChannel!.name),
-                      onFavToggle: () => _toggleFavorite(_currentChannel!.name),
-                      onClose: () => setState(() => _currentChannel = null),
-                    ),
+                    child: _buildPlayer(isFullscreen: false),
                   ),
                 ),
                 const SizedBox(width: 24),
@@ -1185,16 +1237,20 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final String streamUrl;
   final String channelName;
   final bool isFavorited;
+  final bool isFullscreen;
   final VoidCallback onFavToggle;
   final VoidCallback onClose;
+  final ValueChanged<bool> onFullscreenChanged;
 
   const VideoCanvasPlayerLayer({
     super.key,
     required this.streamUrl,
     required this.channelName,
     required this.isFavorited,
+    required this.isFullscreen,
     required this.onFavToggle,
     required this.onClose,
+    required this.onFullscreenChanged,
   });
 
   @override
@@ -1205,7 +1261,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late VlcPlayerController _controller;
 
   bool _showControls = true;
-  bool _isFullscreen = false;
   bool _isPlaying = false;
   String? _errorText;
 
@@ -1225,8 +1280,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late final ValueNotifier<String> _aspectNotifier;
 
   // Shared gesture state so the normal and fullscreen views stay in sync.
-  // Volume goes through VLC (0..100). Brightness is a local dim overlay
-  // (0.15..1.0) so no native permission or plugin is required.
+  // Volume goes through VLC (0..100). Brightness is applied through the
+  // `screen_brightness` plugin using the app-scoped setter, so it does not
+  // modify the system-wide brightness setting.
   final ValueNotifier<int> _volumeNotifier = ValueNotifier<int>(100);
   final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
 
@@ -1237,6 +1293,38 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
     _createController(widget.streamUrl);
     _showControlsTemporarily();
+    _syncInitialBrightness();
+  }
+
+  @override
+  void didUpdateWidget(VideoCanvasPlayerLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Channel switches used to be handled by giving the widget a
+    // ValueKey(streamUrl), which recreated the State. Now that the parent
+    // owns a stable GlobalKey across fullscreen transitions, we have to
+    // detect the URL change ourselves and rebuild the controller in place.
+    if (oldWidget.streamUrl != widget.streamUrl) {
+      _controller.removeListener(_playerListener);
+      _controller.dispose();
+      _tracksLoaded = false;
+      _errorText = null;
+      _selectedAudioTrackId = null;
+      _selectedSubtitleTrackId = null;
+      _audioTracks = [];
+      _subtitleTracks = [];
+      _createController(widget.streamUrl);
+      _showControlsTemporarily();
+    }
+  }
+
+  Future<void> _syncInitialBrightness() async {
+    try {
+      final current = await ScreenBrightness.instance.application;
+      if (!mounted) return;
+      _brightnessNotifier.value = current.clamp(0.0, 1.0);
+    } catch (e) {
+      debugPrint('Could not read application brightness: $e');
+    }
   }
 
   void _createController(String url) {
@@ -1355,60 +1443,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     }
   }
 
-  Future<void> _toggleFullscreen() async {
+  void _toggleFullscreen() {
     _showControlsTemporarily();
-
-    if (_isFullscreen) {
-      Navigator.of(context).pop();
-      return;
-    }
-
-    setState(() => _isFullscreen = true);
-
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-
-    if (!mounted) return;
-
-    await Navigator.of(context).push(
-      PageRouteBuilder(
-        opaque: true,
-        barrierColor: Colors.black,
-        transitionDuration: Duration.zero,
-        reverseTransitionDuration: Duration.zero,
-        pageBuilder: (_, __, ___) => _FullscreenVlcView(
-          controller: _controller,
-          channelName: widget.channelName,
-          fitNotifier: _fitNotifier,
-          aspectNotifier: _aspectNotifier,
-          isPlayingNotifier: _playingNotifier,
-          volumeNotifier: _volumeNotifier,
-          brightnessNotifier: _brightnessNotifier,
-          isFavorited: widget.isFavorited,
-          onFavToggle: widget.onFavToggle,
-          onSettings: _openPlayerSettingsDialog,
-          onPlayPause: _togglePlayPause,
-          onExit: () => Navigator.of(context).pop(),
-          onTouch: _showControlsTemporarily,
-        ),
-      ),
-    );
-
-    // The SAME VLC controller is still alive. Explicitly resume it after
-    // returning because some versions of the plugin pause native rendering
-    // while the route is being changed.
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-
-    if (!mounted) return;
-
-    setState(() => _isFullscreen = false);
-
-    // Do not call play(), pause(), stop(), or setMedia() here. The controller
-    // remains the same controller, so changing fullscreen must not intentionally
-    // restart the live stream or change the user's play/pause choice.
-    _isPlaying = _controller.value.isPlaying;
-    _playingNotifier.value = _isPlaying;
-
-    _showControlsTemporarily();
+    // Fullscreen ownership lives in _MainDashboardState so the VlcPlayer
+    // widget is never unmounted across the transition (which would tear
+    // down the platform view and force VLC to re-buffer the live stream).
+    widget.onFullscreenChanged(!widget.isFullscreen);
   }
 
   late final ValueNotifier<bool> _playingNotifier = ValueNotifier<bool>(false);
@@ -1575,11 +1615,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     VlcVideoFit newFit;
 
-    // Fit to screen intentionally stretches the stream to the complete
+    // "Fit to screen" intentionally stretches the stream to the complete
     // available player rectangle in both normal and fullscreen modes.
+    // 16:9 and 4:3 use `cover` so the stream fills the selected rectangle
+    // and any overflow is cropped, rather than letterboxing inside it.
     newFit = aspect == 'Fit to screen'
         ? VlcVideoFit.fill
-        : VlcVideoFit.contain;
+        : VlcVideoFit.cover;
 
     if (mounted) {
       setState(() {
@@ -1614,6 +1656,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void dispose() {
     _controlsTimer?.cancel();
+    // Restore the pre-player screen brightness so closing the video does
+    // not leave the whole app dimmed or blown out.
+    ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
+      (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
+    );
     _fitNotifier.dispose();
     _aspectNotifier.dispose();
     _playingNotifier.dispose();
@@ -1633,9 +1680,19 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
     switch (_selectedAspectRatio) {
       case '16:9':
-        return Center(child: AspectRatio(aspectRatio: 16 / 9, child: player));
+        return Center(
+          child: AspectRatio(
+            aspectRatio: 16 / 9,
+            child: ClipRect(child: player),
+          ),
+        );
       case '4:3':
-        return Center(child: AspectRatio(aspectRatio: 4 / 3, child: player));
+        return Center(
+          child: AspectRatio(
+            aspectRatio: 4 / 3,
+            child: ClipRect(child: player),
+          ),
+        );
       default:
         return Positioned.fill(child: player);
     }
@@ -1645,11 +1702,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Widget build(BuildContext context) {
     _syncPlayingNotifier();
 
-    // The fullscreen route owns the native VLC widget while it is open.
-    if (_isFullscreen) {
-      return const ColoredBox(color: Colors.black);
-    }
-
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -1657,8 +1709,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
-        // Left/right vertical drag: brightness / volume. Also paints the
-        // dim overlay used to fake brightness reduction.
+        // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
           controller: _controller,
           volumeNotifier: _volumeNotifier,
@@ -1741,8 +1792,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         onPressed: widget.onFavToggle,
                       ),
                       _playerIconButton(
-                        icon: Icons.fullscreen,
-                        tooltip: 'Fullscreen',
+                        icon: widget.isFullscreen
+                            ? Icons.fullscreen_exit
+                            : Icons.fullscreen,
+                        tooltip: widget.isFullscreen
+                            ? 'Exit Fullscreen'
+                            : 'Fullscreen',
                         onPressed: _toggleFullscreen,
                       ),
                     ],
@@ -1789,231 +1844,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 }
 
-class _FullscreenVlcView extends StatefulWidget {
-  final VlcPlayerController controller;
-  final String channelName;
-  final ValueNotifier<VlcVideoFit> fitNotifier;
-  final ValueNotifier<String> aspectNotifier;
-  final ValueNotifier<bool> isPlayingNotifier;
-  final ValueNotifier<int> volumeNotifier;
-  final ValueNotifier<double> brightnessNotifier;
-  final bool isFavorited;
-  final VoidCallback onFavToggle;
-  final Future<void> Function() onSettings;
-  final Future<void> Function() onPlayPause;
-  final VoidCallback onExit;
-  final VoidCallback onTouch;
-
-  const _FullscreenVlcView({
-    required this.controller,
-    required this.channelName,
-    required this.fitNotifier,
-    required this.aspectNotifier,
-    required this.isPlayingNotifier,
-    required this.volumeNotifier,
-    required this.brightnessNotifier,
-    required this.isFavorited,
-    required this.onFavToggle,
-    required this.onSettings,
-    required this.onPlayPause,
-    required this.onExit,
-    required this.onTouch,
-  });
-
-  @override
-  State<_FullscreenVlcView> createState() => _FullscreenVlcViewState();
-}
-
-class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
-  bool _showControls = true;
-  Timer? _hideTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    _showControlsTemporarily();
-  }
-
-  void _showControlsTemporarily() {
-    if (!mounted) return;
-    setState(() => _showControls = true);
-    _hideTimer?.cancel();
-    _hideTimer = Timer(const Duration(seconds: 4), () {
-      if (mounted) setState(() => _showControls = false);
-    });
-  }
-
-  @override
-  void dispose() {
-    _hideTimer?.cancel();
-    super.dispose();
-  }
-
-  Widget _buildFullscreenVideo(VlcVideoFit fit, String aspect) {
-    final player = VlcPlayer(
-      controller: widget.controller,
-      backgroundColor: Colors.black,
-      fit: fit,
-    );
-
-    if (aspect == '16:9') {
-      return Center(child: AspectRatio(aspectRatio: 16 / 9, child: player));
-    }
-    if (aspect == '4:3') {
-      return Center(child: AspectRatio(aspectRatio: 4 / 3, child: player));
-    }
-    return Positioned.fill(child: player);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          ValueListenableBuilder<String>(
-            valueListenable: widget.aspectNotifier,
-            builder: (_, aspect, __) {
-              return ValueListenableBuilder<VlcVideoFit>(
-                valueListenable: widget.fitNotifier,
-                builder: (_, fit, __) => _buildFullscreenVideo(fit, aspect),
-              );
-            },
-          ),
-
-          // Left/right vertical drag: brightness / volume (shared with the
-          // normal view via notifiers so state stays consistent).
-          _VideoGestureLayer(
-            controller: widget.controller,
-            volumeNotifier: widget.volumeNotifier,
-            brightnessNotifier: widget.brightnessNotifier,
-          ),
-
-          // This layer receives every touch on the video and never changes
-          // playback by itself.
-          Positioned.fill(
-            child: Listener(
-              behavior: HitTestBehavior.translucent,
-              onPointerDown: (_) {
-                _showControlsTemporarily();
-                widget.onTouch();
-              },
-              child: const SizedBox.expand(),
-            ),
-          ),
-
-          if (_showControls)
-            Positioned.fill(
-              child: Column(
-                children: [
-                  SafeArea(
-                    bottom: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                      child: IgnorePointer(
-                        child: Text(
-                          widget.channelName,
-                          textAlign: TextAlign.center,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 17,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(blurRadius: 5, color: Colors.black),
-                              Shadow(blurRadius: 10, color: Colors.black),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const Spacer(),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 18),
-                    child: ValueListenableBuilder<bool>(
-                      valueListenable: widget.isPlayingNotifier,
-                      builder: (_, playing, __) {
-                        return Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            _fullIconButton(
-                              icon: playing ? Icons.pause : Icons.play_arrow,
-                              tooltip: playing ? 'Pause' : 'Play',
-                              onPressed: () async {
-                                _showControlsTemporarily();
-                                await widget.onPlayPause();
-                              },
-                            ),
-                            _fullIconButton(
-                              icon: Icons.settings,
-                              tooltip: 'Player Settings',
-                              onPressed: () async {
-                                _showControlsTemporarily();
-                                await widget.onSettings();
-                              },
-                            ),
-                            _fullIconButton(
-                              icon: widget.isFavorited ? Icons.star : Icons.star_border,
-                              tooltip: 'Favorite',
-                              iconColor:
-                                  widget.isFavorited ? ShroudyColors.goldText : Colors.white,
-                              onPressed: () {
-                                _showControlsTemporarily();
-                                widget.onFavToggle();
-                              },
-                            ),
-                            _fullIconButton(
-                              icon: Icons.fullscreen_exit,
-                              tooltip: 'Exit Fullscreen',
-                              onPressed: widget.onExit,
-                            ),
-                          ],
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _fullIconButton({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onPressed,
-    Color iconColor = Colors.white,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 5),
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: onPressed,
-          child: Tooltip(
-            message: tooltip,
-            child: Container(
-              width: 52,
-              height: 52,
-              decoration: BoxDecoration(
-                color: Colors.black.withAlpha(125),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(icon, color: iconColor, size: 27),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 extension on VlcPlayerValue {
   String? get errorMessage => null;
 }
@@ -2021,10 +1851,9 @@ extension on VlcPlayerValue {
 enum _GestureSide { volume, brightness }
 
 /// Transparent overlay that turns vertical drags on the left half of the
-/// video into brightness changes and vertical drags on the right half into
-/// volume changes. Also paints a black overlay whose alpha is derived from
-/// [brightnessNotifier], which is how brightness reduction is faked without
-/// needing a native screen-brightness plugin.
+/// video into brightness changes (via the `screen_brightness` plugin, which
+/// is app-scoped so it does not touch the system-wide setting) and vertical
+/// drags on the right half into VLC volume changes.
 class _VideoGestureLayer extends StatefulWidget {
   final VlcPlayerController controller;
   final ValueNotifier<int> volumeNotifier;
@@ -2041,8 +1870,11 @@ class _VideoGestureLayer extends StatefulWidget {
 }
 
 class _VideoGestureLayerState extends State<_VideoGestureLayer> {
-  static const double _minBrightness = 0.15;
-  static const double _dragRangePx = 200.0;
+  static const double _minBrightness = 0.02;
+  static const double _dragRangePx = 220.0;
+  // Skip platform calls for sub-perceptual brightness deltas so we don't
+  // spam the plugin channel on high-refresh displays.
+  static const double _brightnessEpsilon = 0.01;
 
   _GestureSide? _activeSide;
   double _startY = 0;
@@ -2050,14 +1882,27 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
   bool _showIndicator = false;
   Timer? _hideTimer;
 
+  // In-flight guards: at most one native call per stream is pending, and
+  // the latest requested value is replayed once the current call resolves.
+  // Prevents 60+ queued platform-channel calls during a fast drag.
+  bool _volumeCallInFlight = false;
+  int? _pendingVolume;
+  bool _brightnessCallInFlight = false;
+  double? _pendingBrightness;
+
   void _onStart(DragStartDetails d, _GestureSide side) {
     _hideTimer?.cancel();
+    final sideChanged = _activeSide != side;
     _activeSide = side;
     _startY = d.globalPosition.dy;
     _startValue = side == _GestureSide.volume
         ? widget.volumeNotifier.value / 100.0
         : widget.brightnessNotifier.value;
-    if (!_showIndicator) setState(() => _showIndicator = true);
+    // Always rebuild when the side changes so the indicator flips to the
+    // correct edge even if the previous drag's hide timer hadn't fired yet.
+    if (sideChanged || !_showIndicator) {
+      setState(() => _showIndicator = true);
+    }
   }
 
   void _onUpdate(DragUpdateDetails d, _GestureSide side) {
@@ -2069,20 +1914,66 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
       final next = ((_startValue + delta) * 100).round().clamp(0, 100);
       if (next != widget.volumeNotifier.value) {
         widget.volumeNotifier.value = next;
-        // Fire-and-forget: rapid drag updates should not queue up awaits.
-        widget.controller.setVolume(next).catchError((Object e) {
-          debugPrint('VLC setVolume error: $e');
-        });
+        _requestVolume(next);
       }
     } else {
       final next = (_startValue + delta).clamp(_minBrightness, 1.0);
-      if (next != widget.brightnessNotifier.value) {
+      if ((next - widget.brightnessNotifier.value).abs() >= _brightnessEpsilon ||
+          next == _minBrightness ||
+          next == 1.0) {
         widget.brightnessNotifier.value = next;
+        _requestBrightness(next);
       }
     }
 
-    if (!_showIndicator) setState(() => _showIndicator = true);
     _hideTimer?.cancel();
+    if (!_showIndicator) setState(() => _showIndicator = true);
+  }
+
+  void _requestVolume(int v) {
+    if (_volumeCallInFlight) {
+      _pendingVolume = v;
+      return;
+    }
+    _volumeCallInFlight = true;
+    widget.controller.setVolume(v).then(
+      (_) {
+        _volumeCallInFlight = false;
+        final pending = _pendingVolume;
+        _pendingVolume = null;
+        if (pending != null && pending != v && mounted) _requestVolume(pending);
+      },
+      onError: (Object e) {
+        debugPrint('VLC setVolume error: $e');
+        _volumeCallInFlight = false;
+        _pendingVolume = null;
+      },
+    );
+  }
+
+  void _requestBrightness(double b) {
+    if (_brightnessCallInFlight) {
+      _pendingBrightness = b;
+      return;
+    }
+    _brightnessCallInFlight = true;
+    ScreenBrightness.instance.setApplicationScreenBrightness(b).then(
+      (_) {
+        _brightnessCallInFlight = false;
+        final pending = _pendingBrightness;
+        _pendingBrightness = null;
+        if (pending != null &&
+            (pending - b).abs() >= _brightnessEpsilon &&
+            mounted) {
+          _requestBrightness(pending);
+        }
+      },
+      onError: (Object e) {
+        debugPrint('setApplicationScreenBrightness error: $e');
+        _brightnessCallInFlight = false;
+        _pendingBrightness = null;
+      },
+    );
   }
 
   void _onEnd(DragEndDetails d, _GestureSide side) {
@@ -2107,15 +1998,6 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        ValueListenableBuilder<double>(
-          valueListenable: widget.brightnessNotifier,
-          builder: (_, b, __) {
-            final alpha = ((1.0 - b) * 255).round().clamp(0, 255);
-            return IgnorePointer(
-              child: ColoredBox(color: Colors.black.withAlpha(alpha)),
-            );
-          },
-        ),
         Row(
           children: [
             Expanded(
@@ -2154,7 +2036,29 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
                   : Alignment.centerLeft,
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 28),
-                child: _buildIndicator(),
+                // ValueListenableBuilder keeps the indicator reactive during
+                // the drag without rebuilding the whole gesture layer.
+                child: _activeSide == _GestureSide.volume
+                    ? ValueListenableBuilder<int>(
+                        valueListenable: widget.volumeNotifier,
+                        builder: (_, v, __) => _indicatorBody(
+                          icon: v == 0
+                              ? Icons.volume_off
+                              : (v < 50 ? Icons.volume_down : Icons.volume_up),
+                          fraction: (v / 100.0).clamp(0.0, 1.0),
+                          label: '$v%',
+                        ),
+                      )
+                    : ValueListenableBuilder<double>(
+                        valueListenable: widget.brightnessNotifier,
+                        builder: (_, b, __) => _indicatorBody(
+                          icon: Icons.brightness_6,
+                          fraction: ((b - _minBrightness) /
+                                  (1.0 - _minBrightness))
+                              .clamp(0.0, 1.0),
+                          label: '${(b * 100).round()}%',
+                        ),
+                      ),
               ),
             ),
           ),
@@ -2162,24 +2066,11 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
     );
   }
 
-  Widget _buildIndicator() {
-    final isVolume = _activeSide == _GestureSide.volume;
-    final raw = isVolume
-        ? widget.volumeNotifier.value / 100.0
-        : (widget.brightnessNotifier.value - _minBrightness) / (1.0 - _minBrightness);
-    final fraction = raw.clamp(0.0, 1.0);
-
-    final int volValue = widget.volumeNotifier.value;
-    final IconData icon = isVolume
-        ? (volValue == 0
-            ? Icons.volume_off
-            : (volValue < 50 ? Icons.volume_down : Icons.volume_up))
-        : Icons.brightness_6;
-
-    final label = isVolume
-        ? '$volValue%'
-        : '${(widget.brightnessNotifier.value * 100).round()}%';
-
+  Widget _indicatorBody({
+    required IconData icon,
+    required double fraction,
+    required String label,
+  }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
