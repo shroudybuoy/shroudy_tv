@@ -1472,8 +1472,10 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
     try {
-      // VlcPlayerController exposes separate play and pause commands. Use
-      // VLC's current state rather than an optimistic local toggle.
+      // vlc_player 2.1.2 has no playOrPause(); branch on VLC's real playback
+      // state rather than an optimistic local flag. Reading value.isPlaying
+      // keeps the toggle in sync with the native listener on live streams,
+      // which is what stops the icon from flipping straight back.
       if (_controller.value.isPlaying) {
         await _controller.pause();
       } else {
@@ -1842,23 +1844,38 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                 SafeArea(
                   bottom: false,
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                    child: IgnorePointer(
-                      child: Text(
-                        widget.channelName,
-                        textAlign: TextAlign.center,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          shadows: [
-                            Shadow(blurRadius: 5, color: Colors.black),
-                            Shadow(blurRadius: 10, color: Colors.black),
-                          ],
+                    padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: IgnorePointer(
+                            child: Text(
+                              widget.channelName,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                shadows: [
+                                  Shadow(blurRadius: 5, color: Colors.black),
+                                  Shadow(blurRadius: 10, color: Colors.black),
+                                ],
+                              ),
+                            ),
+                          ),
                         ),
-                      ),
+                        // Top-right back button: exits fullscreen. Only shown
+                        // in fullscreen, where there is no other chrome to
+                        // leave with (the split view has its own Back button).
+                        if (widget.isFullscreen)
+                          _playerIconButton(
+                            icon: Icons.arrow_back,
+                            tooltip: 'Exit Fullscreen',
+                            onPressed: () => widget.onFullscreenChanged(false),
+                          ),
+                      ],
                     ),
                   ),
                 ),
