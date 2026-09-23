@@ -33,12 +33,14 @@ class ChannelItem {
   final String logoUrl;
   final String streamUrl;
   final String category;
+  final String tvgId;
 
   ChannelItem({
     required this.name,
     required this.logoUrl,
     required this.streamUrl,
     required this.category,
+    required this.tvgId,
   });
 }
 
@@ -89,6 +91,7 @@ class _MainDashboardState extends State<MainDashboard> {
   bool _isLoading = true;
   final Map<String, EpgData> _epgByChannel = {};
   Timer? _epgRefreshTimer;
+  String? _playlistEpgUrl;
 
   @override
   void initState() {
@@ -108,7 +111,20 @@ class _MainDashboardState extends State<MainDashboard> {
         String currentName = '';
         String currentLogo = '';
         String currentCategory = 'Uncategorized';
+        String currentTvgId = '';
         final categoriesSet = <String>{};
+
+        // Use the EPG URL declared by the playlist header.
+        for (final raw in lines.take(10)) {
+          final header = raw.trim();
+          if (header.toUpperCase().startsWith('#EXTM3U')) {
+            final declaredEpg = _extractAttribute(header, 'x-tvg-url');
+            if (declaredEpg.isNotEmpty) {
+              _playlistEpgUrl = declaredEpg;
+              break;
+            }
+          }
+        }
 
         for (var line in lines) {
           final cleanLine = line.trim().replaceAll('\r', '');
@@ -126,6 +142,7 @@ class _MainDashboardState extends State<MainDashboard> {
 
             currentLogo = _extractAttribute(cleanLine, 'logo');
             currentCategory = _extractAttribute(cleanLine, 'group-title');
+            currentTvgId = _extractAttribute(cleanLine, 'tvg-id');
 
             if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
             categoriesSet.add(currentCategory);
@@ -137,10 +154,12 @@ class _MainDashboardState extends State<MainDashboard> {
                   logoUrl: currentLogo,
                   streamUrl: cleanLine,
                   category: currentCategory,
+                  tvgId: currentTvgId,
                 ),
               );
               currentName = '';
               currentLogo = '';
+              currentTvgId = '';
             }
           }
         }
@@ -165,6 +184,36 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
 
+  DateTime? _parseXmltvDate(String? raw) {
+    if (raw == null) return null;
+    final value = raw.trim();
+    try {
+      return DateTime.parse(value).toLocal();
+    } catch (_) {}
+
+    // XMLTV commonly uses: yyyyMMddHHmmss +0000 / yyyyMMddHHmmss -0500
+    final match = RegExp(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?$').firstMatch(value);
+    if (match == null) return null;
+
+    final year = int.parse(match.group(1)!);
+    final month = int.parse(match.group(2)!);
+    final day = int.parse(match.group(3)!);
+    final hour = int.parse(match.group(4)!);
+    final minute = int.parse(match.group(5)!);
+    final second = int.parse(match.group(6)!);
+    final sign = match.group(7);
+    final tzHour = int.tryParse(match.group(8) ?? '0') ?? 0;
+    final tzMinute = int.tryParse(match.group(9) ?? '0') ?? 0;
+
+    if (sign == null) {
+      return DateTime(year, month, day, hour, minute, second);
+    }
+
+    final offset = Duration(hours: tzHour, minutes: tzMinute);
+    final utc = DateTime.utc(year, month, day, hour, minute, second);
+    return (sign == '+') ? utc.subtract(offset).toLocal() : utc.add(offset).toLocal();
+  }
+
   String _normalizeEpgName(String value) {
     return value
         .toLowerCase()
@@ -184,11 +233,12 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   Future<void> _fetchEpg() async {
-    const urls = <String>[
+    final urls = <String>[
+      if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
       'https://iptv-org.github.io/epg/guides/in.xml.gz',
       'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
       'https://iptv-epg.org/files/epg-in.xml.gz',
-    ];
+    ].toSet().toList();
 
     for (final url in urls) {
       try {
@@ -237,52 +287,86 @@ class _MainDashboardState extends State<MainDashboard> {
           if (startRaw == null || stopRaw == null || titleMatch == null) continue;
           DateTime? start;
           DateTime? stop;
-          try {
-            start = DateTime.parse(startRaw.trim());
-            stop = DateTime.parse(stopRaw.trim());
-          } catch (_) {
-            continue;
-          }
+          start = _parseXmltvDate(startRaw);
+          stop = _parseXmltvDate(stopRaw);
+          if (start == null || stop == null) continue;
           final title = _decodeXmlText(titleMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
           if (title.isEmpty) continue;
           (programmes[channelId] ??= []).add(EpgProgram(start: start, stop: stop, title: title));
         }
 
         final now = DateTime.now();
-        final byName = <String, List<EpgProgram>>{};
-        programmes.forEach((id, list) {
-          final display = channelNames[id];
-          if (display == null) return;
-          final key = _normalizeEpgName(display);
-          if (key.isEmpty) return;
-          byName[key] = list;
-        });
-
         final result = <String, EpgData>{};
+
+        // Primary match: M3U tvg-id == XMLTV programme channel id.
+        // This is the reliable mapping for playlists such as
+        // SonyEntertainmentTelevision.in@HD -> SonyEntertainmentTelevision.in@HD.
         for (final channel in _allChannelsList) {
-          final key = _normalizeEpgName(channel.name);
-          List<EpgProgram>? list = byName[key];
-          if (list == null) {
-            for (final entry in byName.entries) {
-              if (entry.key == key || entry.key.contains(key) || key.contains(entry.key)) {
-                list = entry.value;
-                break;
-              }
-            }
-          }
-          if (list == null) continue;
+          final id = channel.tvgId.trim();
+          if (id.isEmpty) continue;
+
+          final list = programmes[id];
+          if (list == null || list.isEmpty) continue;
+
           list.sort((a, b) => a.start.compareTo(b.start));
           EpgProgram? current;
           EpgProgram? next;
-          for (final p in list) {
-            if (p.start.isBefore(now) && p.stop.isAfter(now)) {
-              current = p;
-            } else if (p.start.isAfter(now)) {
-              next = p;
+          for (final program in list) {
+            if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
+              current = program;
+              continue;
+            }
+            if (program.start.isAfter(now)) {
+              next = program;
               break;
             }
           }
-          if (current != null || next != null) result[channel.name] = EpgData(now: current, next: next);
+
+          if (current != null || next != null) {
+            result[channel.tvgId] = EpgData(now: current, next: next);
+          }
+        }
+
+        // Only use display-name matching as a fallback for playlist entries
+        // that do not provide tvg-id. Never override an exact tvg-id match.
+        if (result.length < _allChannelsList.where((c) => c.tvgId.isNotEmpty).length) {
+          final byName = <String, List<EpgProgram>>{};
+          programmes.forEach((id, list) {
+            final display = channelNames[id];
+            if (display == null) return;
+            final key = _normalizeEpgName(display);
+            if (key.isNotEmpty) byName[key] = list;
+          });
+
+          for (final channel in _allChannelsList.where((c) => c.tvgId.isEmpty)) {
+            final key = _normalizeEpgName(channel.name);
+            List<EpgProgram>? list = byName[key];
+            if (list == null) {
+              for (final entry in byName.entries) {
+                if (entry.key == key || entry.key.contains(key) || key.contains(entry.key)) {
+                  list = entry.value;
+                  break;
+                }
+              }
+            }
+            if (list == null) continue;
+            list.sort((a, b) => a.start.compareTo(b.start));
+            EpgProgram? current;
+            EpgProgram? next;
+            for (final program in list) {
+              if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
+                current = program;
+                continue;
+              }
+              if (program.start.isAfter(now)) {
+                next = program;
+                break;
+              }
+            }
+            if (current != null || next != null) {
+              result[channel.tvgId.isEmpty ? channel.name : channel.tvgId] = EpgData(now: current, next: next);
+            }
+          }
         }
 
         if (mounted) {
@@ -454,7 +538,8 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
   Widget _buildEpgPanel(ChannelItem channel) {
-    final data = _epgByChannel[channel.name];
+    final epgKey = channel.tvgId.trim().isNotEmpty ? channel.tvgId.trim() : channel.name;
+    final data = _epgByChannel[epgKey];
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
