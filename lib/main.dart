@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,12 @@ import 'package:vlc_player/vlc_player.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Keep channel logos in memory for the whole app session so each one is
+  // downloaded once and never re-fetched until the app is closed. Flutter's
+  // ImageCache is in-memory only (cleared on process exit) and is what
+  // Image.network uses under the hood.
+  PaintingBinding.instance.imageCache.maximumSize = 2000;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20; // 256 MB
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -74,6 +81,126 @@ class EpgData {
   });
 }
 
+/// Animated boot/splash screen shown while the playlist and channel logos load.
+class BootSplash extends StatefulWidget {
+  const BootSplash({super.key});
+
+  @override
+  State<BootSplash> createState() => _BootSplashState();
+}
+
+class _BootSplashState extends State<BootSplash> with TickerProviderStateMixin {
+  // Gentle "breathing" pulse on the logo badge.
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1300),
+  )..repeat(reverse: true);
+
+  // One-shot entrance for the whole composition.
+  late final AnimationController _entrance = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    _entrance.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fade = CurvedAnimation(parent: _entrance, curve: Curves.easeOut);
+    final rise = Tween<Offset>(
+      begin: const Offset(0, 0.12),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _entrance, curve: Curves.easeOutCubic));
+    final scale = Tween<double>(begin: 0.86, end: 1.0).animate(
+      CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+    );
+
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [ShroudyColors.darkNavyBg, ShroudyColors.cardNavyBg],
+          ),
+        ),
+        child: Center(
+          child: FadeTransition(
+            opacity: fade,
+            child: SlideTransition(
+              position: rise,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ScaleTransition(
+                    scale: scale,
+                    child: Container(
+                      width: 96,
+                      height: 96,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [ShroudyColors.primaryRed, Color(0xFFB91C1C)],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: ShroudyColors.primaryRed.withAlpha(115),
+                            blurRadius: 34,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(Icons.live_tv, color: Colors.white, size: 46),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  const Text(
+                    'SHROUDY TV',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 6,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'i P a d',
+                    style: TextStyle(
+                      color: Colors.white.withAlpha(150),
+                      fontSize: 13,
+                      letterSpacing: 4,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 36),
+                  SizedBox(
+                    width: 150,
+                    child: LinearProgressIndicator(
+                      minHeight: 3,
+                      backgroundColor: Colors.white.withAlpha(30),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        ShroudyColors.primaryRed,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ShroudyTvApp extends StatelessWidget {
   const ShroudyTvApp({super.key});
 
@@ -110,6 +237,11 @@ class _MainDashboardState extends State<MainDashboard> {
   Timer? _epgRefreshTimer;
   String? _playlistEpgUrl;
 
+  // Boot splash timing: keep it on screen for at least _minBootDuration so the
+  // animation plays out even when the playlist loads almost instantly.
+  final DateTime _bootStart = DateTime.now();
+  static const Duration _minBootDuration = Duration(milliseconds: 2200);
+
   // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
   // that toggling it only changes the layout around the player. The player
   // widget itself is kept alive via _playerKey across the transition, which
@@ -123,6 +255,14 @@ class _MainDashboardState extends State<MainDashboard> {
     super.initState();
     _fetchM3uPlaylist();
     _epgRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) => _refreshCurrentEpg());
+  }
+
+  // Waits out the remaining minimum boot time (if any), then reveals the UI.
+  Future<void> _finishBoot() async {
+    final remaining = _minBootDuration - DateTime.now().difference(_bootStart);
+    if (remaining > Duration.zero) await Future.delayed(remaining);
+    if (!mounted) return;
+    setState(() => _isLoading = false);
   }
 
   Future<void> _fetchM3uPlaylist() async {
@@ -196,15 +336,15 @@ class _MainDashboardState extends State<MainDashboard> {
         setState(() {
           _favoritesList.addAll(savedFavs);
           _categoriesList.addAll(categoriesSet.toList()..sort());
-          _isLoading = false;
         });
         _fetchEpg();
+        await _finishBoot();
       } else {
-        if (mounted) setState(() => _isLoading = false);
+        await _finishBoot();
       }
     } catch (e) {
       debugPrint('Playlist error: $e');
-      if (mounted) setState(() => _isLoading = false);
+      await _finishBoot();
     }
   }
 
@@ -665,14 +805,28 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   List<ChannelItem> _getFilteredChannels() {
-    return _allChannelsList.where((ch) {
-      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
-      if (_selectedCategory == '★ Favorites') {
-        return _favoritesList.contains(ch.name) && matchesSearch;
-      }
-      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
-      return matchesCat && matchesSearch;
-    }).toList();
+    final query = _searchQuery.trim().toLowerCase();
+    bool matchesSearch(ChannelItem ch) =>
+        query.isEmpty || ch.name.toLowerCase().contains(query);
+
+    // The Favorites tab stays scoped to favorites even while searching.
+    if (_selectedCategory == '★ Favorites') {
+      return _allChannelsList
+          .where((ch) => _favoritesList.contains(ch.name) && matchesSearch(ch))
+          .toList();
+    }
+
+    // A non-empty search is global: it spans every category, not just the
+    // selected tab, so a channel is found no matter which category it lives in.
+    if (query.isNotEmpty) {
+      return _allChannelsList.where(matchesSearch).toList();
+    }
+
+    // No search: fall back to the selected category (or all).
+    return _allChannelsList
+        .where((ch) =>
+            _selectedCategory == 'All' || ch.category == _selectedCategory)
+        .toList();
   }
 
   // Switches to the previous/next channel within the list the user is
@@ -702,9 +856,7 @@ class _MainDashboardState extends State<MainDashboard> {
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
-      );
+      return const BootSplash();
     }
 
     final filteredChannels = _getFilteredChannels();
@@ -989,12 +1141,13 @@ class _MainDashboardState extends State<MainDashboard> {
           if (imageUrl.isNotEmpty)
             ClipRRect(
               borderRadius: BorderRadius.circular(7),
-              child: SizedBox(
+              child: Container(
                 width: double.infinity,
                 height: 150,
+                color: Colors.black,
                 child: Image.network(
                   imageUrl,
-                  fit: BoxFit.cover,
+                  fit: BoxFit.contain,
                   errorBuilder: (_, __, ___) => Container(
                     color: Colors.black26,
                     alignment: Alignment.center,
@@ -1298,6 +1451,10 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   bool _showControls = true;
   bool _isPlaying = false;
+  // Set when the user pauses. On live streams VLC may ignore pause(), so this
+  // is the source of truth for the button icon; _togglePlayPause force-stops the
+  // stream if VLC is still playing shortly after a pause request.
+  bool _userPaused = false;
   String? _errorText;
 
   VlcVideoFit _currentFit = VlcVideoFit.fill;
@@ -1397,6 +1554,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
     _controller.addListener(_playerListener);
     _isPlaying = true;
+    _userPaused = false;
     _playingNotifier.value = true;
   }
 
@@ -1475,16 +1633,29 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
+    final value = _controller.value;
+    // Want to pause unless we already consider it paused (user-paused, or VLC
+    // itself reports a paused/stopped/ended/idle state).
+    final wantPause = !(_userPaused || _isPausedState(value.state));
     try {
-      // vlc_player 2.1.2 has no playOrPause(). On live streams VLC spends a lot
-      // of time in opening/buffering rather than the strict `playing` state, so
-      // branching on value.isPlaying made every tap call play() (a no-op) and
-      // pause appeared dead. Instead: only resume when actually paused/stopped,
-      // otherwise pause. This is the single source of truth the icon also uses.
-      if (_isPausedState(_controller.value.state)) {
-        await _controller.play();
-      } else {
+      if (wantPause) {
+        // Flip the UI immediately so the button feels responsive even before
+        // the native state event arrives.
+        setState(() => _userPaused = true);
         await _controller.pause();
+        // Live IPTV inputs frequently ignore pause() (canPause == false), so the
+        // picture keeps running. Verify shortly after: if VLC is still active,
+        // force stop(), which reliably freezes a live stream. play() re-opens it
+        // at the live edge on resume.
+        Future.delayed(const Duration(milliseconds: 600), () async {
+          if (!mounted || !_userPaused) return;
+          if (!_isPausedState(_controller.value.state)) {
+            await _controller.stop();
+          }
+        });
+      } else {
+        setState(() => _userPaused = false);
+        await _controller.play();
       }
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
@@ -1769,6 +1940,30 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
+        // Buffering spinner: shown while VLC is opening/re-buffering the stream
+        // (initial load, channel switch, or resuming after a paused stop).
+        // IgnorePointer so it never blocks the gesture or control layers.
+        ValueListenableBuilder<VlcPlayerValue>(
+          valueListenable: _controller,
+          builder: (context, value, _) {
+            final loading = value.state == VlcPlaybackState.opening ||
+                value.state == VlcPlaybackState.buffering;
+            if (!loading) return const SizedBox.shrink();
+            return const IgnorePointer(
+              child: Center(
+                child: SizedBox(
+                  width: 46,
+                  height: 46,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 3.5,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
           volumeNotifier: _volumeNotifier,
@@ -1855,12 +2050,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         tooltip: 'Previous Channel',
                         onPressed: widget.onPrevious,
                       ),
-                      // Icon reads the controller's live state directly so it
-                      // can never disagree with what _togglePlayPause does.
+                      // Icon reflects the user's pause intent first (so it flips
+                      // instantly), falling back to VLC's reported state.
                       ValueListenableBuilder<VlcPlayerValue>(
                         valueListenable: _controller,
                         builder: (context, value, _) {
-                          final paused = _isPausedState(value.state);
+                          final paused = _userPaused || _isPausedState(value.state);
                           return _playerIconButton(
                             icon: paused ? Icons.play_arrow : Icons.pause,
                             tooltip: paused ? 'Play' : 'Pause',
