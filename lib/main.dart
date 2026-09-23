@@ -1299,6 +1299,10 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   bool _showControls = true;
   bool _isPlaying = false;
+  // Set when the user pauses. On live streams VLC may ignore pause(), so this
+  // is the source of truth for the button icon; _togglePlayPause force-stops the
+  // stream if VLC is still playing shortly after a pause request.
+  bool _userPaused = false;
   String? _errorText;
 
   VlcVideoFit _currentFit = VlcVideoFit.fill;
@@ -1398,6 +1402,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
     _controller.addListener(_playerListener);
     _isPlaying = true;
+    _userPaused = false;
     _playingNotifier.value = true;
   }
 
@@ -1476,30 +1481,30 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
+    final value = _controller.value;
+    // Want to pause unless we already consider it paused (user-paused, or VLC
+    // itself reports a paused/stopped/ended/idle state).
+    final wantPause = !(_userPaused || _isPausedState(value.state));
     try {
-      // vlc_player 2.1.2 has no playOrPause(). On live streams VLC spends a lot
-      // of time in opening/buffering rather than the strict `playing` state, so
-      // branching on value.isPlaying made every tap call play() (a no-op) and
-      // pause appeared dead. Instead: only resume when actually paused/stopped,
-      // otherwise pause. This is the single source of truth the icon also uses.
-      final before = _controller.value;
-      final paused = _isPausedState(before.state);
-      debugPrint(
-        'PLAYPAUSE tap -> before state=${before.state} isLive=${before.isLive} '
-        'isSeekable=${before.isSeekable} action=${paused ? "play" : "pause"}',
-      );
-      if (paused) {
-        await _controller.play();
-      } else {
+      if (wantPause) {
+        // Flip the UI immediately so the button feels responsive even before
+        // the native state event arrives.
+        setState(() => _userPaused = true);
         await _controller.pause();
+        // Live IPTV inputs frequently ignore pause() (canPause == false), so the
+        // picture keeps running. Verify shortly after: if VLC is still active,
+        // force stop(), which reliably freezes a live stream. play() re-opens it
+        // at the live edge on resume.
+        Future.delayed(const Duration(milliseconds: 600), () async {
+          if (!mounted || !_userPaused) return;
+          if (!_isPausedState(_controller.value.state)) {
+            await _controller.stop();
+          }
+        });
+      } else {
+        setState(() => _userPaused = false);
+        await _controller.play();
       }
-      // Report what VLC actually did ~600ms later so we can tell whether a live
-      // input is refusing to pause (state stays playing) vs. honoring it.
-      Future.delayed(const Duration(milliseconds: 600), () {
-        if (!mounted) return;
-        final after = _controller.value;
-        debugPrint('PLAYPAUSE after -> state=${after.state} isPlaying=${after.isPlaying}');
-      });
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
     }
@@ -1783,6 +1788,30 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
+        // Buffering spinner: shown while VLC is opening/re-buffering the stream
+        // (initial load, channel switch, or resuming after a paused stop).
+        // IgnorePointer so it never blocks the gesture or control layers.
+        ValueListenableBuilder<VlcPlayerValue>(
+          valueListenable: _controller,
+          builder: (context, value, _) {
+            final loading = value.state == VlcPlaybackState.opening ||
+                value.state == VlcPlaybackState.buffering;
+            if (!loading) return const SizedBox.shrink();
+            return const IgnorePointer(
+              child: Center(
+                child: SizedBox(
+                  width: 46,
+                  height: 46,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 3.5,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
           volumeNotifier: _volumeNotifier,
@@ -1869,12 +1898,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         tooltip: 'Previous Channel',
                         onPressed: widget.onPrevious,
                       ),
-                      // Icon reads the controller's live state directly so it
-                      // can never disagree with what _togglePlayPause does.
+                      // Icon reflects the user's pause intent first (so it flips
+                      // instantly), falling back to VLC's reported state.
                       ValueListenableBuilder<VlcPlayerValue>(
                         valueListenable: _controller,
                         builder: (context, value, _) {
-                          final paused = _isPausedState(value.state);
+                          final paused = _userPaused || _isPausedState(value.state);
                           return _playerIconButton(
                             icon: paused ? Icons.play_arrow : Icons.pause,
                             tooltip: paused ? 'Play' : 'Pause',
