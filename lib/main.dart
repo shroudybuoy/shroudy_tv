@@ -48,7 +48,16 @@ class EpgProgram {
   final DateTime start;
   final DateTime stop;
   final String title;
-  const EpgProgram({required this.start, required this.stop, required this.title});
+  final String description;
+  final String? imageUrl;
+
+  const EpgProgram({
+    required this.start,
+    required this.stop,
+    required this.title,
+    this.description = '',
+    this.imageUrl,
+  });
 }
 
 class EpgData {
@@ -253,6 +262,50 @@ class _MainDashboardState extends State<MainDashboard> {
         .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.tryParse(m.group(1)!) ?? 32));
   }
 
+  String _cleanEpgText(String value) {
+    return _decodeXmlText(value.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+  }
+
+  String _englishXmlText(String body, String tag) {
+    final matches = RegExp(
+      '<$tag\\b([^>]*)>(.*?)</$tag\\s*>',
+      caseSensitive: false,
+      dotAll: true,
+    ).allMatches(body);
+
+    String? firstText;
+    for (final match in matches) {
+      final attrs = match.group(1) ?? '';
+      final text = _cleanEpgText(match.group(2) ?? '');
+      if (text.isEmpty) continue;
+      firstText ??= text;
+
+      final langMatch = RegExp(
+        r'''\blang\s*=\s*["']([^"']+)["']''',
+        caseSensitive: false,
+      ).firstMatch(attrs);
+      final lang = langMatch?.group(1)?.toLowerCase() ?? '';
+
+      if (lang == 'en' ||
+          lang.startsWith('en-') ||
+          lang.startsWith('en_') ||
+          lang == 'eng' ||
+          lang == 'english') {
+        return text;
+      }
+    }
+    return firstText ?? '';
+  }
+
+  String? _xmlIconUrl(String body) {
+    final match = RegExp(
+      r'''<icon\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>''',
+      caseSensitive: false,
+    ).firstMatch(body);
+    final value = match?.group(1)?.trim();
+    return value == null || value.isEmpty ? null : _decodeXmlText(value);
+  }
+
   Future<void> _fetchEpg() async {
     final urls = <String>[
       if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
@@ -296,9 +349,25 @@ class _MainDashboardState extends State<MainDashboard> {
     bool hasUsefulData(EpgData data) =>
         data.now != null || data.next != null || data.upcoming.isNotEmpty;
 
+    EpgProgram? mergeProgram(EpgProgram? preferred, EpgProgram? fallback) {
+      if (preferred == null) return fallback;
+      if (fallback == null) return preferred;
+      return EpgProgram(
+        start: preferred.start,
+        stop: preferred.stop,
+        title: preferred.title,
+        description: preferred.description.isNotEmpty
+            ? preferred.description
+            : fallback.description,
+        imageUrl: preferred.imageUrl?.isNotEmpty == true
+            ? preferred.imageUrl
+            : fallback.imageUrl,
+      );
+    }
+
     EpgData mergeData(EpgData oldData, EpgData newData) {
-      final now = newData.now ?? oldData.now;
-      final next = newData.next ?? oldData.next;
+      final now = mergeProgram(newData.now, oldData.now);
+      final next = mergeProgram(newData.next, oldData.next);
 
       final allUpcoming = <String, EpgProgram>{};
       for (final p in oldData.upcoming) {
@@ -384,12 +453,6 @@ class _MainDashboardState extends State<MainDashboard> {
           r'\bstop\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
           caseSensitive: false,
         );
-        final titleRegex = RegExp(
-          r'<title\b[^>]*>(.*?)</title\s*>',
-          caseSensitive: false,
-          dotAll: true,
-        );
-
         for (final m in programmeRegex.allMatches(xml)) {
           final attrs = m.group(1)!;
           final body = m.group(2)!;
@@ -397,13 +460,11 @@ class _MainDashboardState extends State<MainDashboard> {
           final channelId = channelAttr.firstMatch(attrs)?.group(1)?.trim();
           final startRaw = attrStart.firstMatch(attrs)?.group(1);
           final stopRaw = attrStop.firstMatch(attrs)?.group(1);
-          final titleMatch = titleRegex.firstMatch(body);
 
           if (channelId == null ||
               channelId.isEmpty ||
               startRaw == null ||
-              stopRaw == null ||
-              titleMatch == null) {
+              stopRaw == null) {
             continue;
           }
 
@@ -411,13 +472,22 @@ class _MainDashboardState extends State<MainDashboard> {
           final stop = _parseXmltvDate(stopRaw);
           if (start == null || stop == null || !stop.isAfter(start)) continue;
 
-          final title = _decodeXmlText(
-            titleMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim(),
-          );
+          // Prefer the English XMLTV title when the provider supplies one.
+          // If no English field exists, retain the provider's first title.
+          final title = _englishXmlText(body, 'title');
           if (title.isEmpty) continue;
 
+          final description = _englishXmlText(body, 'desc');
+          final imageUrl = _xmlIconUrl(body);
+
           (programmes[channelId] ??= []).add(
-            EpgProgram(start: start, stop: stop, title: title),
+            EpgProgram(
+              start: start,
+              stop: stop,
+              title: title,
+              description: description,
+              imageUrl: imageUrl,
+            ),
           );
         }
 
@@ -699,8 +769,6 @@ class _MainDashboardState extends State<MainDashboard> {
             ),
           ),
           const SizedBox(height: 12),
-
-          // Current channel logo, centered under "You are watching".
           Center(
             child: Container(
               width: 110,
@@ -716,11 +784,8 @@ class _MainDashboardState extends State<MainDashboard> {
                   : Image.network(
                       channel.logoUrl,
                       fit: BoxFit.contain,
-                      errorBuilder: (_, __, ___) => const Icon(
-                        Icons.tv,
-                        color: Colors.white,
-                        size: 34,
-                      ),
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.tv, color: Colors.white, size: 34),
                     ),
             ),
           ),
@@ -738,7 +803,6 @@ class _MainDashboardState extends State<MainDashboard> {
               ),
             ),
           ),
-
           const SizedBox(height: 18),
           const Text(
             'EPG • PROGRAMME GUIDE',
@@ -750,30 +814,9 @@ class _MainDashboardState extends State<MainDashboard> {
           ),
           const SizedBox(height: 12),
 
-          if (data?.now != null) ...[
-            const Text(
-              'LIVE NOW',
-              style: TextStyle(
-                color: Colors.greenAccent,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 5),
-            Text(
-              data!.now!.title,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 15,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 5),
-            Text(
-              '${_formatEpgTime(data.now!.start)} – ${_formatEpgTime(data.now!.stop)}',
-              style: const TextStyle(color: Colors.grey, fontSize: 11),
-            ),
-          ] else
+          if (data?.now != null)
+            _buildLiveNowCard(data!.now!, channel.logoUrl)
+          else
             const Text(
               'No LIVE NOW programme found.',
               style: TextStyle(color: Colors.grey, fontSize: 12),
@@ -790,20 +833,8 @@ class _MainDashboardState extends State<MainDashboard> {
                 fontWeight: FontWeight.bold,
               ),
             ),
-            const SizedBox(height: 5),
-            Text(
-              data!.next!.title,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 5),
-            Text(
-              '${_formatEpgTime(data.next!.start)} – ${_formatEpgTime(data.next!.stop)}',
-              style: const TextStyle(color: Colors.grey, fontSize: 11),
-            ),
+            const SizedBox(height: 6),
+            _buildEpgProgrammeRow(data!.next!, channel.logoUrl),
           ],
 
           const SizedBox(height: 18),
@@ -819,39 +850,7 @@ class _MainDashboardState extends State<MainDashboard> {
             ),
             const SizedBox(height: 8),
             ...data!.upcoming.skip(1).take(5).map(
-              (program) => Container(
-                width: double.infinity,
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: ShroudyColors.innerLogoBg,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      program.title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
-                      style: const TextStyle(
-                        color: Colors.grey,
-                        fontSize: 10,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              (program) => _buildEpgProgrammeRow(program, channel.logoUrl),
             ),
           ] else if (data != null) ...[
             const Text(
@@ -867,6 +866,176 @@ class _MainDashboardState extends State<MainDashboard> {
               style: TextStyle(color: Colors.grey, fontSize: 12),
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLiveNowCard(EpgProgram program, String channelLogoUrl) {
+    final imageUrl = (program.imageUrl?.trim().isNotEmpty == true)
+        ? program.imageUrl!.trim()
+        : channelLogoUrl.trim();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: ShroudyColors.innerLogoBg,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.greenAccent.withAlpha(100)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'LIVE NOW',
+            style: TextStyle(
+              color: Colors.greenAccent,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          if (imageUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(7),
+              child: AspectRatio(
+                aspectRatio: 16 / 9,
+                child: Image.network(
+                  imageUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                    color: Colors.black26,
+                    alignment: Alignment.center,
+                    child: const Icon(
+                      Icons.live_tv,
+                      color: Colors.white54,
+                      size: 34,
+                    ),
+                  ),
+                ),
+              ),
+            )
+          else
+            Container(
+              height: 130,
+              width: double.infinity,
+              color: Colors.black26,
+              alignment: Alignment.center,
+              child: const Icon(Icons.live_tv, color: Colors.white54, size: 34),
+            ),
+          const SizedBox(height: 9),
+          Text(
+            program.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
+            style: const TextStyle(color: Colors.grey, fontSize: 11),
+          ),
+          if (program.description.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              program.description.trim(),
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                height: 1.35,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEpgProgrammeRow(EpgProgram program, String channelLogoUrl) {
+    final imageUrl = (program.imageUrl?.trim().isNotEmpty == true)
+        ? program.imageUrl!.trim()
+        : channelLogoUrl.trim();
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: ShroudyColors.innerLogoBg,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (imageUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.network(
+                imageUrl,
+                width: 72,
+                height: 48,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Container(
+                  width: 72,
+                  height: 48,
+                  color: Colors.black26,
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.tv, color: Colors.white54, size: 22),
+                ),
+              ),
+            )
+          else
+            Container(
+              width: 72,
+              height: 48,
+              color: Colors.black26,
+              alignment: Alignment.center,
+              child: const Icon(Icons.tv, color: Colors.white54, size: 22),
+            ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  program.title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
+                  style: const TextStyle(color: Colors.grey, fontSize: 10),
+                ),
+                if (program.description.trim().isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    program.description.trim(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 10,
+                      height: 1.25,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -1040,7 +1209,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   bool _isPlaying = false;
   String? _errorText;
 
-  VlcVideoFit _currentFit = VlcVideoFit.contain;
+  VlcVideoFit _currentFit = VlcVideoFit.fill;
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
@@ -1398,9 +1567,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     VlcVideoFit newFit;
 
-    // All three modes preserve the source image. The AspectRatio wrapper below
-    // controls the physical display rectangle; VLC contain prevents distortion/cropping.
-    newFit = VlcVideoFit.contain;
+    // Fit to screen intentionally stretches the stream to the complete
+    // available player rectangle in both normal and fullscreen modes.
+    newFit = aspect == 'Fit to screen'
+        ? VlcVideoFit.fill
+        : VlcVideoFit.contain;
 
     if (mounted) {
       setState(() {
@@ -1447,7 +1618,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: VlcVideoFit.contain,
+      fit: fit,
     );
 
     switch (_selectedAspectRatio) {
@@ -1660,7 +1831,7 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
     final player = VlcPlayer(
       controller: widget.controller,
       backgroundColor: Colors.black,
-      fit: VlcVideoFit.contain,
+      fit: fit,
     );
 
     if (aspect == '16:9') {
