@@ -989,12 +989,13 @@ class _MainDashboardState extends State<MainDashboard> {
           if (imageUrl.isNotEmpty)
             ClipRRect(
               borderRadius: BorderRadius.circular(7),
-              child: SizedBox(
+              child: Container(
                 width: double.infinity,
                 height: 150,
+                color: Colors.black,
                 child: Image.network(
                   imageUrl,
-                  fit: BoxFit.cover,
+                  fit: BoxFit.contain,
                   errorBuilder: (_, __, ___) => Container(
                     color: Colors.black26,
                     alignment: Alignment.center,
@@ -1481,11 +1482,24 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       // branching on value.isPlaying made every tap call play() (a no-op) and
       // pause appeared dead. Instead: only resume when actually paused/stopped,
       // otherwise pause. This is the single source of truth the icon also uses.
-      if (_isPausedState(_controller.value.state)) {
+      final before = _controller.value;
+      final paused = _isPausedState(before.state);
+      debugPrint(
+        'PLAYPAUSE tap -> before state=${before.state} isLive=${before.isLive} '
+        'isSeekable=${before.isSeekable} action=${paused ? "play" : "pause"}',
+      );
+      if (paused) {
         await _controller.play();
       } else {
         await _controller.pause();
       }
+      // Report what VLC actually did ~600ms later so we can tell whether a live
+      // input is refusing to pause (state stays playing) vs. honoring it.
+      Future.delayed(const Duration(milliseconds: 600), () {
+        if (!mounted) return;
+        final after = _controller.value;
+        debugPrint('PLAYPAUSE after -> state=${after.state} isPlaying=${after.isPlaying}');
+      });
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
     }
