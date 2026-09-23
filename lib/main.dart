@@ -171,7 +171,7 @@ class _BootSplashState extends State<BootSplash> with TickerProviderStateMixin {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'i P a d',
+                    'i O S',
                     style: TextStyle(
                       color: Colors.white.withAlpha(150),
                       fontSize: 13,
@@ -1315,7 +1315,7 @@ class _MainDashboardState extends State<MainDashboard> {
               Expanded(
                 child: Text(
                   '📺  Shroudy TV',
-                  style: const TextStyle(color: Color.fromARGB(255, 235, 112, 208), fontSize: 20, fontWeight: FontWeight.bold),
+                  style: const TextStyle(color: Color.fromARGB(255, 230, 189, 101), fontSize: 20, fontWeight: FontWeight.bold),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
