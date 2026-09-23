@@ -54,7 +54,13 @@ class EpgProgram {
 class EpgData {
   final EpgProgram? now;
   final EpgProgram? next;
-  const EpgData({this.now, this.next});
+  final List<EpgProgram> upcoming;
+
+  const EpgData({
+    this.now,
+    this.next,
+    this.upcoming = const [],
+  });
 }
 
 class ShroudyTvApp extends StatelessWidget {
@@ -225,6 +231,15 @@ class _MainDashboardState extends State<MainDashboard> {
     var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
     v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
     v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+
+    // Normalize common provider/channel-name differences so the same
+    // channel can be matched even when M3U and XMLTV use different labels.
+    v = v.replaceAll(RegExp(r'\bfull hd\b'), ' ');
+    v = v.replaceAll(RegExp(r'\bhigh definition\b'), ' ');
+    v = v.replaceAll(RegExp(r'\b(\d+\s*)?(hd|sd)\b'), ' ');
+    v = v.replaceAll(RegExp(r'\b(india|indian|tv channel|channel)\b'), ' ');
+    v = v.replaceAll(RegExp(r'\s+'), ' ').trim();
+
     return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
   }
 
@@ -246,10 +261,73 @@ class _MainDashboardState extends State<MainDashboard> {
       'https://iptv-epg.org/files/epg-in.xml.gz',
     ].toSet().toList();
 
+    // Do NOT stop after the first working EPG source.
+    // A source can be reachable but contain only a small subset of channels.
+    // We merge matches from every source so sparse EPG files can fill gaps.
+    final merged = <String, EpgData>{};
+
+    EpgData buildData(List<EpgProgram>? source) {
+      if (source == null || source.isEmpty) {
+        return const EpgData();
+      }
+
+      final sorted = List<EpgProgram>.from(source)
+        ..sort((a, b) => a.start.compareTo(b.start));
+
+      final now = DateTime.now();
+      EpgProgram? current;
+      final future = <EpgProgram>[];
+
+      for (final program in sorted) {
+        if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
+          current ??= program;
+        } else if (program.start.isAfter(now)) {
+          future.add(program);
+        }
+      }
+
+      return EpgData(
+        now: current,
+        next: future.isNotEmpty ? future.first : null,
+        upcoming: future.take(6).toList(),
+      );
+    }
+
+    bool hasUsefulData(EpgData data) =>
+        data.now != null || data.next != null || data.upcoming.isNotEmpty;
+
+    EpgData mergeData(EpgData oldData, EpgData newData) {
+      final now = newData.now ?? oldData.now;
+      final next = newData.next ?? oldData.next;
+
+      final allUpcoming = <String, EpgProgram>{};
+      for (final p in oldData.upcoming) {
+        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
+      }
+      for (final p in newData.upcoming) {
+        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
+      }
+
+      final upcoming = allUpcoming.values.toList()
+        ..sort((a, b) => a.start.compareTo(b.start));
+
+      return EpgData(
+        now: now,
+        next: next,
+        upcoming: upcoming.take(6).toList(),
+      );
+    }
+
     for (final url in urls) {
       try {
-        final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 25));
-        if (response.statusCode < 200 || response.statusCode >= 300) continue;
+        final response = await http
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 25));
+
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          debugPrint('EPG source HTTP ${response.statusCode}: $url');
+          continue;
+        }
 
         String xml;
         final bytes = response.bodyBytes;
@@ -260,126 +338,191 @@ class _MainDashboardState extends State<MainDashboard> {
         }
 
         final channelNames = <String, String>{};
+
         final channelRegex = RegExp(
-          r'<channel\s+[^>]*id="([^"]+)"[^>]*>(.*?)</channel>',
+          r'<channel\b[^>]*\bid\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r'][^>]*>(.*?)</channel\s*>',
           caseSensitive: false,
           dotAll: true,
         );
-        final displayRegex = RegExp(r'<display-name[^>]*>(.*?)</display-name>', caseSensitive: false, dotAll: true);
+
+        final displayRegex = RegExp(
+          r'<display-name\b[^>]*>(.*?)</display-name\s*>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+
         for (final m in channelRegex.allMatches(xml)) {
           final id = m.group(1)!.trim();
           final body = m.group(2)!;
           final dm = displayRegex.firstMatch(body);
-          if (dm != null) channelNames[id] = _decodeXmlText(dm.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+          if (dm != null) {
+            channelNames[id] = _decodeXmlText(
+              dm.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim(),
+            );
+          }
         }
 
         final programmes = <String, List<EpgProgram>>{};
+
+        // Match programme elements regardless of attribute ordering and
+        // support both single- and double-quoted XML attributes.
         final programmeRegex = RegExp(
-          r'<programme\s+([^>]*channel="([^"]+)"[^>]*)>(.*?)</programme>',
+          r'<programme\b([^>]*)>(.*?)</programme\s*>',
           caseSensitive: false,
           dotAll: true,
         );
-        final attrStart = RegExp(r'\bstart="([^"]+)"', caseSensitive: false);
-        final attrStop = RegExp(r'\bstop="([^"]+)"', caseSensitive: false);
-        final titleRegex = RegExp(r'<title[^>]*>(.*?)</title>', caseSensitive: false, dotAll: true);
+
+        final channelAttr = RegExp(
+          r'\bchannel\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        final attrStart = RegExp(
+          r'\bstart\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        final attrStop = RegExp(
+          r'\bstop\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        final titleRegex = RegExp(
+          r'<title\b[^>]*>(.*?)</title\s*>',
+          caseSensitive: false,
+          dotAll: true,
+        );
 
         for (final m in programmeRegex.allMatches(xml)) {
           final attrs = m.group(1)!;
-          final channelId = m.group(2)!.trim();
-          final body = m.group(3)!;
+          final body = m.group(2)!;
+
+          final channelId = channelAttr.firstMatch(attrs)?.group(1)?.trim();
           final startRaw = attrStart.firstMatch(attrs)?.group(1);
           final stopRaw = attrStop.firstMatch(attrs)?.group(1);
           final titleMatch = titleRegex.firstMatch(body);
-          if (startRaw == null || stopRaw == null || titleMatch == null) continue;
-          DateTime? start;
-          DateTime? stop;
-          start = _parseXmltvDate(startRaw);
-          stop = _parseXmltvDate(stopRaw);
-          if (start == null || stop == null) continue;
-          final title = _decodeXmlText(titleMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+
+          if (channelId == null ||
+              channelId.isEmpty ||
+              startRaw == null ||
+              stopRaw == null ||
+              titleMatch == null) {
+            continue;
+          }
+
+          final start = _parseXmltvDate(startRaw);
+          final stop = _parseXmltvDate(stopRaw);
+          if (start == null || stop == null || !stop.isAfter(start)) continue;
+
+          final title = _decodeXmlText(
+            titleMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim(),
+          );
           if (title.isEmpty) continue;
-          (programmes[channelId] ??= []).add(EpgProgram(start: start, stop: stop, title: title));
+
+          (programmes[channelId] ??= []).add(
+            EpgProgram(start: start, stop: stop, title: title),
+          );
         }
 
-        final now = DateTime.now();
-        final result = <String, EpgData>{};
-
-        EpgData? pickEpg(List<EpgProgram>? source) {
-          if (source == null || source.isEmpty) return null;
-          source.sort((a, b) => a.start.compareTo(b.start));
-          EpgProgram? current;
-          EpgProgram? next;
-          for (final program in source) {
-            if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
-              current = program;
-            } else if (program.start.isAfter(now)) {
-              next = program;
-              break;
-            }
-          }
-          if (current == null && next == null) return null;
-          return EpgData(now: current, next: next);
-        }
-
-        // First: exact M3U tvg-id == XMLTV channel id.
-        for (final channel in _allChannelsList) {
-          final id = channel.tvgId.trim();
-          if (id.isEmpty) continue;
-          EpgData? data = pickEpg(programmes[id]);
-          if (data == null) {
-            for (final entry in programmes.entries) {
-              if (entry.key.toLowerCase() == id.toLowerCase()) {
-                data = pickEpg(entry.value);
-                break;
-              }
-            }
-          }
-          if (data != null) result[id] = data;
-        }
-
-        // Second: name fallback for ALL channels. This is important for custom
-        // provider IDs such as ts56, which do not exist in XMLTV.
+        // Create a normalized display-name index for this source.
         final byName = <String, List<EpgProgram>>{};
         programmes.forEach((id, list) {
           final display = channelNames[id];
           if (display == null || display.trim().isEmpty) return;
+
           final key = _epgNameKey(display);
-          if (key.isNotEmpty) byName[key] = list;
+          if (key.isNotEmpty) {
+            (byName[key] ??= <EpgProgram>[]).addAll(list);
+          }
         });
 
         for (final channel in _allChannelsList) {
-          final resultKey = channel.tvgId.trim().isNotEmpty ? channel.tvgId.trim() : channel.name;
-          if (result.containsKey(resultKey)) continue;
+          final resultKey = channel.tvgId.trim().isNotEmpty
+              ? channel.tvgId.trim()
+              : channel.name;
 
-          final channelKey = _epgNameKey(channel.name);
-          List<EpgProgram>? list = byName[channelKey];
-          if (list == null && channelKey.isNotEmpty) {
-            for (final entry in byName.entries) {
-              if (entry.key == channelKey || entry.key.contains(channelKey) || channelKey.contains(entry.key)) {
-                list = entry.value;
-                break;
+          List<EpgProgram>? matched;
+
+          // 1. Exact tvg-id match.
+          final id = channel.tvgId.trim();
+          if (id.isNotEmpty) {
+            matched = programmes[id];
+            if (matched == null) {
+              for (final entry in programmes.entries) {
+                if (entry.key.toLowerCase() == id.toLowerCase()) {
+                  matched = entry.value;
+                  break;
+                }
               }
             }
           }
-          final data = pickEpg(list);
-          if (data != null) result[resultKey] = data;
+
+          // 2. Exact normalized channel-name match.
+          final channelKey = _epgNameKey(channel.name);
+          matched ??= byName[channelKey];
+
+          // 3. Fuzzy normalized-name match for provider naming differences.
+          if (matched == null && channelKey.isNotEmpty) {
+            int bestScore = 0;
+            for (final entry in byName.entries) {
+              final epgKey = entry.key;
+              int score = 0;
+
+              if (epgKey == channelKey) {
+                score = 100;
+              } else if (epgKey.contains(channelKey) || channelKey.contains(epgKey)) {
+                score = 80;
+              } else {
+                final channelTokens = _epgTokens(channelKey);
+                final epgTokens = _epgTokens(epgKey);
+                final overlap = channelTokens.intersection(epgTokens).length;
+                if (overlap >= 2) score = 50 + overlap;
+              }
+
+              if (score > bestScore) {
+                bestScore = score;
+                matched = entry.value;
+              }
+            }
+          }
+
+          if (matched == null || matched.isEmpty) continue;
+
+          final data = buildData(matched);
+          if (!hasUsefulData(data)) continue;
+
+          final previous = merged[resultKey];
+          merged[resultKey] =
+              previous == null ? data : mergeData(previous, data);
         }
 
-        debugPrint('EPG parsed: ${programmes.length} XMLTV channel IDs, ${result.length} matched playlist channels from $url');
-
-        if (mounted) {
-          setState(() {
-            _epgByChannel
-              ..clear()
-              ..addAll(result);
-          });
-        }
-        debugPrint('EPG loaded: ${result.length} channels from $url');
-        return;
+        debugPrint(
+          'EPG source parsed: ${programmes.length} XMLTV IDs, '
+          '${merged.length} matched playlist channels from $url',
+        );
       } catch (e) {
         debugPrint('EPG source failed $url: $e');
       }
     }
+
+    if (!mounted) return;
+
+    setState(() {
+      _epgByChannel
+        ..clear()
+        ..addAll(merged);
+    });
+
+    debugPrint('EPG merged: ${merged.length}/${_allChannelsList.length} channels');
+  }
+
+  Set<String> _epgTokens(String value) {
+    final ignored = <String>{
+      'tv', 'television', 'channel', 'india', 'hd', 'sd',
+      'english', 'hindi', 'live', 'network',
+    };
+
+    return value
+        .split(RegExp(r'[^a-z0-9]+'))
+        .where((e) => e.length >= 2 && !ignored.contains(e))
+        .toSet();
   }
 
   Future<void> _refreshCurrentEpg() async {
@@ -536,35 +679,193 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
   Widget _buildEpgPanel(ChannelItem channel) {
-    final epgKey = channel.tvgId.trim().isNotEmpty ? channel.tvgId.trim() : channel.name;
+    final epgKey = channel.tvgId.trim().isNotEmpty
+        ? channel.tvgId.trim()
+        : channel.name;
     final data = _epgByChannel[epgKey];
+
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('YOU ARE WATCHING', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 16),
-          const Text('EPG • PROGRAMME GUIDE', style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
+          const Center(
+            child: Text(
+              'YOU ARE WATCHING',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
           const SizedBox(height: 12),
+
+          // Current channel logo, centered under "You are watching".
+          Center(
+            child: Container(
+              width: 110,
+              height: 76,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: ShroudyColors.innerLogoBg,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: ShroudyColors.accentBorder),
+              ),
+              child: channel.logoUrl.trim().isEmpty
+                  ? const Icon(Icons.tv, color: Colors.white, size: 34)
+                  : Image.network(
+                      channel.logoUrl,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, __, ___) => const Icon(
+                        Icons.tv,
+                        color: Colors.white,
+                        size: 34,
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: Text(
+              channel.name,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 18),
+          const Text(
+            'EPG • PROGRAMME GUIDE',
+            style: TextStyle(
+              color: ShroudyColors.primaryRed,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 12),
+
           if (data?.now != null) ...[
-            const Text('LIVE NOW', style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+            const Text(
+              'LIVE NOW',
+              style: TextStyle(
+                color: Colors.greenAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 5),
-            Text(data!.now!.title, style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+            Text(
+              data!.now!.title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 5),
-            Text('${_formatEpgTime(data.now!.start)} – ${_formatEpgTime(data.now!.stop)}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+            Text(
+              '${_formatEpgTime(data.now!.start)} – ${_formatEpgTime(data.now!.stop)}',
+              style: const TextStyle(color: Colors.grey, fontSize: 11),
+            ),
           ] else
-            const Text('No LIVE NOW programme found.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+            const Text(
+              'No LIVE NOW programme found.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+
           const SizedBox(height: 16),
+
           if (data?.next != null) ...[
-            const Text('NEXT', style: TextStyle(color: Colors.orangeAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+            const Text(
+              'NEXT',
+              style: TextStyle(
+                color: Colors.orangeAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
             const SizedBox(height: 5),
-            Text(data!.next!.title, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+            Text(
+              data!.next!.title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
             const SizedBox(height: 5),
-            Text('${_formatEpgTime(data.next!.start)} – ${_formatEpgTime(data.next!.stop)}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+            Text(
+              '${_formatEpgTime(data.next!.start)} – ${_formatEpgTime(data.next!.stop)}',
+              style: const TextStyle(color: Colors.grey, fontSize: 11),
+            ),
           ],
+
+          const SizedBox(height: 18),
+
+          if (data?.upcoming.isNotEmpty == true) ...[
+            const Text(
+              'UPCOMING',
+              style: TextStyle(
+                color: Colors.lightBlueAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ...data!.upcoming.skip(1).take(5).map(
+              (program) => Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: ShroudyColors.innerLogoBg,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      program.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
+                      style: const TextStyle(
+                        color: Colors.grey,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ] else if (data != null) ...[
+            const Text(
+              'No additional upcoming programmes found.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+
           if (data == null) ...[
             const SizedBox(height: 10),
-            const Text('EPG is loading or this channel could not be matched.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+            const Text(
+              'EPG is loading or this channel could not be matched.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
           ],
         ],
       ),
