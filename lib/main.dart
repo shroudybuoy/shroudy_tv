@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,6 +12,12 @@ import 'package:vlc_player/vlc_player.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Keep channel logos in memory for the whole app session so each one is
+  // downloaded once and never re-fetched until the app is closed. Flutter's
+  // ImageCache is in-memory only (cleared on process exit) and is what
+  // Image.network uses under the hood.
+  PaintingBinding.instance.imageCache.maximumSize = 2000;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20; // 256 MB
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -73,100 +78,6 @@ class EpgData {
     this.next,
     this.upcoming = const [],
   });
-}
-
-/// In-memory cache of channel logo bytes that lives for the whole app session.
-/// Logos are downloaded once and reused from RAM (as compressed bytes, which is
-/// far cheaper than a decoded-image cache) until the process exits — i.e. until
-/// the user closes the app. Nothing is written to disk.
-class _LogoCache {
-  static final Map<String, Uint8List> _bytes = <String, Uint8List>{};
-  static final Map<String, Future<Uint8List?>> _inFlight =
-      <String, Future<Uint8List?>>{};
-
-  static Future<Uint8List?> load(String url) {
-    final key = url.trim();
-    if (key.isEmpty) return Future.value(null);
-
-    final cached = _bytes[key];
-    if (cached != null) return Future.value(cached);
-
-    final pending = _inFlight[key];
-    if (pending != null) return pending;
-
-    final future = http.get(Uri.parse(key)).then<Uint8List?>((res) {
-      _inFlight.remove(key);
-      if (res.statusCode == 200 && res.bodyBytes.isNotEmpty) {
-        _bytes[key] = res.bodyBytes;
-        return res.bodyBytes;
-      }
-      return null;
-    }).catchError((Object e) {
-      _inFlight.remove(key);
-      debugPrint('Logo fetch failed for $key: $e');
-      return null;
-    });
-    _inFlight[key] = future;
-    return future;
-  }
-}
-
-/// Renders a channel logo from the session cache. Falls back to [fallback] while
-/// loading or if the URL is empty/unreachable.
-class SessionLogo extends StatefulWidget {
-  final String url;
-  final double? width;
-  final double? height;
-  final BoxFit fit;
-  final Widget fallback;
-
-  const SessionLogo({
-    super.key,
-    required this.url,
-    this.width,
-    this.height,
-    this.fit = BoxFit.contain,
-    this.fallback = const Icon(Icons.tv, color: Colors.white),
-  });
-
-  @override
-  State<SessionLogo> createState() => _SessionLogoState();
-}
-
-class _SessionLogoState extends State<SessionLogo> {
-  Uint8List? _bytes;
-
-  @override
-  void initState() {
-    super.initState();
-    _load(widget.url);
-  }
-
-  @override
-  void didUpdateWidget(SessionLogo oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) _load(widget.url);
-  }
-
-  Future<void> _load(String url) async {
-    final bytes = await _LogoCache.load(url);
-    if (!mounted || bytes == null) return;
-    setState(() => _bytes = bytes);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bytes = _bytes;
-    if (bytes == null) return widget.fallback;
-    return Image.memory(
-      bytes,
-      width: widget.width,
-      height: widget.height,
-      fit: widget.fit,
-      gaplessPlayback: true,
-      errorBuilder: (_, _, _) => widget.fallback,
-    );
-  }
 }
 
 /// Animated boot/splash screen shown while the playlist and channel logos load.
@@ -1061,10 +972,10 @@ class _MainDashboardState extends State<MainDashboard> {
                 child: Container(
                   color: ShroudyColors.innerLogoBg,
                   width: double.infinity,
-                  child: SessionLogo(
-                    url: channel.logoUrl,
+                  child: Image.network(
+                    channel.logoUrl,
                     fit: BoxFit.contain,
-                    fallback: const Icon(Icons.tv, color: Colors.white),
+                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
                   ),
                 ),
               ),
@@ -1111,10 +1022,11 @@ class _MainDashboardState extends State<MainDashboard> {
               ),
               child: channel.logoUrl.trim().isEmpty
                   ? const Icon(Icons.tv, color: Colors.white, size: 34)
-                  : SessionLogo(
-                      url: channel.logoUrl,
+                  : Image.network(
+                      channel.logoUrl,
                       fit: BoxFit.contain,
-                      fallback: const Icon(Icons.tv, color: Colors.white, size: 34),
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.tv, color: Colors.white, size: 34),
                     ),
             ),
           ),
@@ -1478,10 +1390,10 @@ class _MainDashboardState extends State<MainDashboard> {
                                   child: Container(
                                     color: ShroudyColors.innerLogoBg,
                                     width: double.infinity,
-                                    child: SessionLogo(
-                                      url: relChannel.logoUrl,
+                                    child: Image.network(
+                                      relChannel.logoUrl,
                                       fit: BoxFit.contain,
-                                      fallback: const Icon(Icons.tv, color: Colors.white),
+                                      errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
                                     ),
                                   ),
                                 ),
