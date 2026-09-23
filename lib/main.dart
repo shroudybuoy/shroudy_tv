@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -40,6 +42,19 @@ class ChannelItem {
   });
 }
 
+class EpgProgram {
+  final DateTime start;
+  final DateTime stop;
+  final String title;
+  const EpgProgram({required this.start, required this.stop, required this.title});
+}
+
+class EpgData {
+  final EpgProgram? now;
+  final EpgProgram? next;
+  const EpgData({this.now, this.next});
+}
+
 class ShroudyTvApp extends StatelessWidget {
   const ShroudyTvApp({super.key});
 
@@ -72,11 +87,14 @@ class _MainDashboardState extends State<MainDashboard> {
   String _searchQuery = '';
   ChannelItem? _currentChannel;
   bool _isLoading = true;
+  final Map<String, EpgData> _epgByChannel = {};
+  Timer? _epgRefreshTimer;
 
   @override
   void initState() {
     super.initState();
     _fetchM3uPlaylist();
+    _epgRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) => _refreshCurrentEpg());
   }
 
   Future<void> _fetchM3uPlaylist() async {
@@ -136,6 +154,7 @@ class _MainDashboardState extends State<MainDashboard> {
           _categoriesList.addAll(categoriesSet.toList()..sort());
           _isLoading = false;
         });
+        _fetchEpg();
       } else {
         if (mounted) setState(() => _isLoading = false);
       }
@@ -143,6 +162,152 @@ class _MainDashboardState extends State<MainDashboard> {
       debugPrint('Playlist error: $e');
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+
+  String _normalizeEpgName(String value) {
+    return value
+        .toLowerCase()
+        .replaceAll(RegExp(r'&amp;|&#38;'), '&')
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '')
+        .replaceAll(RegExp(r'hd|sd|fhd|uhd'), '');
+  }
+
+  String _decodeXmlText(String value) {
+    return value
+        .replaceAll('&amp;', '&')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.tryParse(m.group(1)!) ?? 32));
+  }
+
+  Future<void> _fetchEpg() async {
+    const urls = <String>[
+      'https://iptv-org.github.io/epg/guides/in.xml.gz',
+      'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
+      'https://iptv-epg.org/files/epg-in.xml.gz',
+    ];
+
+    for (final url in urls) {
+      try {
+        final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 25));
+        if (response.statusCode < 200 || response.statusCode >= 300) continue;
+
+        String xml;
+        final bytes = response.bodyBytes;
+        if (bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+          xml = utf8.decode(GZipCodec().decode(bytes), allowMalformed: true);
+        } else {
+          xml = utf8.decode(bytes, allowMalformed: true);
+        }
+
+        final channelNames = <String, String>{};
+        final channelRegex = RegExp(
+          r'<channel\s+[^>]*id="([^"]+)"[^>]*>(.*?)</channel>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+        final displayRegex = RegExp(r'<display-name[^>]*>(.*?)</display-name>', caseSensitive: false, dotAll: true);
+        for (final m in channelRegex.allMatches(xml)) {
+          final id = m.group(1)!.trim();
+          final body = m.group(2)!;
+          final dm = displayRegex.firstMatch(body);
+          if (dm != null) channelNames[id] = _decodeXmlText(dm.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+        }
+
+        final programmes = <String, List<EpgProgram>>{};
+        final programmeRegex = RegExp(
+          r'<programme\s+([^>]*channel="([^"]+)"[^>]*)>(.*?)</programme>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+        final attrStart = RegExp(r'\bstart="([^"]+)"', caseSensitive: false);
+        final attrStop = RegExp(r'\bstop="([^"]+)"', caseSensitive: false);
+        final titleRegex = RegExp(r'<title[^>]*>(.*?)</title>', caseSensitive: false, dotAll: true);
+
+        for (final m in programmeRegex.allMatches(xml)) {
+          final attrs = m.group(1)!;
+          final channelId = m.group(2)!.trim();
+          final body = m.group(3)!;
+          final startRaw = attrStart.firstMatch(attrs)?.group(1);
+          final stopRaw = attrStop.firstMatch(attrs)?.group(1);
+          final titleMatch = titleRegex.firstMatch(body);
+          if (startRaw == null || stopRaw == null || titleMatch == null) continue;
+          DateTime? start;
+          DateTime? stop;
+          try {
+            start = DateTime.parse(startRaw.trim());
+            stop = DateTime.parse(stopRaw.trim());
+          } catch (_) {
+            continue;
+          }
+          final title = _decodeXmlText(titleMatch.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+          if (title.isEmpty) continue;
+          (programmes[channelId] ??= []).add(EpgProgram(start: start, stop: stop, title: title));
+        }
+
+        final now = DateTime.now();
+        final byName = <String, List<EpgProgram>>{};
+        programmes.forEach((id, list) {
+          final display = channelNames[id];
+          if (display == null) return;
+          final key = _normalizeEpgName(display);
+          if (key.isEmpty) return;
+          byName[key] = list;
+        });
+
+        final result = <String, EpgData>{};
+        for (final channel in _allChannelsList) {
+          final key = _normalizeEpgName(channel.name);
+          List<EpgProgram>? list = byName[key];
+          if (list == null) {
+            for (final entry in byName.entries) {
+              if (entry.key == key || entry.key.contains(key) || key.contains(entry.key)) {
+                list = entry.value;
+                break;
+              }
+            }
+          }
+          if (list == null) continue;
+          list.sort((a, b) => a.start.compareTo(b.start));
+          EpgProgram? current;
+          EpgProgram? next;
+          for (final p in list) {
+            if (p.start.isBefore(now) && p.stop.isAfter(now)) {
+              current = p;
+            } else if (p.start.isAfter(now)) {
+              next = p;
+              break;
+            }
+          }
+          if (current != null || next != null) result[channel.name] = EpgData(now: current, next: next);
+        }
+
+        if (mounted) {
+          setState(() {
+            _epgByChannel
+              ..clear()
+              ..addAll(result);
+          });
+        }
+        debugPrint('EPG loaded: ${result.length} channels from $url');
+        return;
+      } catch (e) {
+        debugPrint('EPG source failed $url: $e');
+      }
+    }
+  }
+
+  Future<void> _refreshCurrentEpg() async {
+    if (_allChannelsList.isNotEmpty) await _fetchEpg();
+  }
+
+  @override
+  void dispose() {
+    _epgRefreshTimer?.cancel();
+    super.dispose();
   }
 
   String _extractAttribute(String line, String attributeName) {
@@ -288,6 +453,48 @@ class _MainDashboardState extends State<MainDashboard> {
       ),
     );
   }
+  Widget _buildEpgPanel(ChannelItem channel) {
+    final data = _epgByChannel[channel.name];
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('YOU ARE WATCHING', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          const Text('EPG • PROGRAMME GUIDE', style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          if (data?.now != null) ...[
+            const Text('LIVE NOW', style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 5),
+            Text(data!.now!.title, style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 5),
+            Text('${_formatEpgTime(data.now!.start)} – ${_formatEpgTime(data.now!.stop)}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+          ] else
+            const Text('No LIVE NOW programme found.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+          const SizedBox(height: 16),
+          if (data?.next != null) ...[
+            const Text('NEXT', style: TextStyle(color: Colors.orangeAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 5),
+            Text(data!.next!.title, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 5),
+            Text('${_formatEpgTime(data.next!.start)} – ${_formatEpgTime(data.next!.stop)}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+          ],
+          if (data == null) ...[
+            const SizedBox(height: 10),
+            const Text('EPG is loading or this channel could not be matched.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _formatEpgTime(DateTime value) {
+    final local = value.toLocal();
+    final h = local.hour % 12 == 0 ? 12 : local.hour % 12;
+    final m = local.minute.toString().padLeft(2, '0');
+    return '$h:$m ${local.hour >= 12 ? 'PM' : 'AM'}';
+  }
+
   Widget _buildPremiumSplitPlayerLayoutView(List<ChannelItem> channels) {
     final relatedChannels = _allChannelsList
         .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
@@ -352,20 +559,7 @@ class _MainDashboardState extends State<MainDashboard> {
                       color: ShroudyColors.cardNavyBg,
                       border: BorderBorder(side: BorderSide(color: ShroudyColors.accentBorder, width: 1)),
                     ),
-                    child: const SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('YOU ARE WATCHING', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 16),
-                          Text('EPG • PROGRAMME GUIDE', style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 6),
-                          Text('NOW • libVLC / VideoLAN decoder', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                          SizedBox(height: 12),
-                          Text('VLC-based playback supports network streams including MPEG-TS and HLS, subject to stream/server compatibility.', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                        ],
-                      ),
-                    ),
+                    child: _buildEpgPanel(_currentChannel!),
                   ),
                 ),
               ],
@@ -502,6 +696,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       autoPlay: true,
     );
     _controller.addListener(_playerListener);
+    _isPlaying = true;
+    _playingNotifier.value = true;
   }
 
   void _playerListener() {
@@ -577,28 +773,26 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
+    final targetPlaying = !_isPlaying;
+    _isPlaying = targetPlaying;
+    _playingNotifier.value = targetPlaying;
+    if (mounted) setState(() {});
 
     try {
-      // Always read the native VLC state immediately before issuing the command.
-      final currentlyPlaying = _controller.value.isPlaying;
-
-      if (currentlyPlaying) {
-        await _controller.pause();
-      } else {
+      // Send exactly one native command. Do not recreate media or controller.
+      if (targetPlaying) {
         await _controller.play();
+      } else {
+        await _controller.pause();
       }
-
-      // Give the native VLC side a moment to publish the new state.
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      if (!mounted) return;
-
-      final newState = _controller.value.isPlaying;
-      setState(() {
-        _isPlaying = newState;
-      });
-      _playingNotifier.value = newState;
+      // Some VLC builds update value.isPlaying asynchronously; let the native
+      // listener correct the icon when the native state arrives.
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
+      if (!mounted) return;
+      _isPlaying = !targetPlaying;
+      _playingNotifier.value = _isPlaying;
+      setState(() {});
     }
   }
 
@@ -610,7 +804,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       return;
     }
 
-    final wasPlayingBeforeFullscreen = _controller.value.isPlaying;
     setState(() => _isFullscreen = true);
 
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -648,17 +841,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
     setState(() => _isFullscreen = false);
 
-    try {
-      // Preserve the state from before fullscreen. Do not unexpectedly start a
-      // stream that the user had paused.
-      if (wasPlayingBeforeFullscreen && !_controller.value.isPlaying) {
-        await _controller.play();
-      }
-      _isPlaying = _controller.value.isPlaying;
-      _playingNotifier.value = _isPlaying;
-    } catch (e) {
-      debugPrint('Could not restore VLC after fullscreen: $e');
-    }
+    // Do not call play(), pause(), stop(), or setMedia() here. The controller
+    // remains the same controller, so changing fullscreen must not intentionally
+    // restart the live stream or change the user's play/pause choice.
+    _isPlaying = _controller.value.isPlaying;
+    _playingNotifier.value = _isPlaying;
 
     _showControlsTemporarily();
   }
@@ -827,16 +1014,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     VlcVideoFit newFit;
 
-    switch (aspect) {
-      case '16:9':
-        newFit = VlcVideoFit.fill;
-        break;
-      case '4:3':
-        newFit = VlcVideoFit.cover;
-        break;
-      default:
-        newFit = VlcVideoFit.contain;
-    }
+    // All three modes preserve the source image. The AspectRatio wrapper below
+    // controls the physical display rectangle; VLC contain prevents distortion/cropping.
+    newFit = VlcVideoFit.contain;
 
     if (mounted) {
       setState(() {
@@ -883,22 +1063,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: fit,
+      fit: VlcVideoFit.contain,
     );
 
-    if (_selectedAspectRatio == '16:9') {
-      return Center(
-        child: AspectRatio(aspectRatio: 16 / 9, child: player),
-      );
+    switch (_selectedAspectRatio) {
+      case '16:9':
+        return Center(child: AspectRatio(aspectRatio: 16 / 9, child: player));
+      case '4:3':
+        return Center(child: AspectRatio(aspectRatio: 4 / 3, child: player));
+      default:
+        return Positioned.fill(child: player);
     }
-
-    if (_selectedAspectRatio == '4:3') {
-      return Center(
-        child: AspectRatio(aspectRatio: 4 / 3, child: player),
-      );
-    }
-
-    return Positioned.fill(child: player);
   }
 
   @override
@@ -1101,7 +1276,7 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
     final player = VlcPlayer(
       controller: widget.controller,
       backgroundColor: Colors.black,
-      fit: fit,
+      fit: VlcVideoFit.contain,
     );
 
     if (aspect == '16:9') {
