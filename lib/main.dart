@@ -206,7 +206,7 @@ class ShroudyTvApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Shroudy TV iPad',
+      title: 'Shroudy TV ios',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         scaffoldBackgroundColor: ShroudyColors.darkNavyBg,
@@ -1314,8 +1314,8 @@ class _MainDashboardState extends State<MainDashboard> {
             children: [
               Expanded(
                 child: Text(
-                  'PLAYING: ${_currentChannel!.name.toUpperCase()}',
-                  style: const TextStyle(color: Color.fromARGB(255, 233, 68, 239), fontSize: 20, fontWeight: FontWeight.bold),
+                  '📺  Shroudy TV',
+                  style: const TextStyle(color: Color.fromARGB(255, 235, 112, 208), fontSize: 20, fontWeight: FontWeight.bold),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
