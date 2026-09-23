@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -658,8 +659,45 @@ class _MainDashboardState extends State<MainDashboard> {
         setState(() => _currentChannel = null);
       },
       onFullscreenChanged: _setPlayerFullscreen,
+      onPrevious: _playPreviousChannel,
+      onNext: _playNextChannel,
     );
   }
+
+  List<ChannelItem> _getFilteredChannels() {
+    return _allChannelsList.where((ch) {
+      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
+      if (_selectedCategory == '★ Favorites') {
+        return _favoritesList.contains(ch.name) && matchesSearch;
+      }
+      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
+      return matchesCat && matchesSearch;
+    }).toList();
+  }
+
+  // Switches to the previous/next channel within the list the user is
+  // currently browsing, wrapping around at the ends. If the playing channel
+  // is no longer in that filtered list, we fall back to the full channel list
+  // so the buttons never dead-end.
+  void _stepChannel(int delta) {
+    final current = _currentChannel;
+    if (current == null) return;
+
+    var channels = _getFilteredChannels();
+    var index = channels.indexWhere((ch) => ch.streamUrl == current.streamUrl);
+    if (index == -1) {
+      channels = _allChannelsList;
+      index = channels.indexWhere((ch) => ch.streamUrl == current.streamUrl);
+    }
+    if (channels.isEmpty || index == -1) return;
+
+    final nextIndex = (index + delta) % channels.length;
+    setState(() => _currentChannel = channels[nextIndex]);
+  }
+
+  void _playPreviousChannel() => _stepChannel(-1);
+
+  void _playNextChannel() => _stepChannel(1);
 
   @override
   Widget build(BuildContext context) {
@@ -669,14 +707,7 @@ class _MainDashboardState extends State<MainDashboard> {
       );
     }
 
-    final filteredChannels = _allChannelsList.where((ch) {
-      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
-      if (_selectedCategory == '★ Favorites') {
-        return _favoritesList.contains(ch.name) && matchesSearch;
-      }
-      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
-      return matchesCat && matchesSearch;
-    }).toList();
+    final filteredChannels = _getFilteredChannels();
 
     Widget body;
     if (_currentChannel == null) {
@@ -1241,6 +1272,8 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final VoidCallback onFavToggle;
   final VoidCallback onClose;
   final ValueChanged<bool> onFullscreenChanged;
+  final VoidCallback onPrevious;
+  final VoidCallback onNext;
 
   const VideoCanvasPlayerLayer({
     super.key,
@@ -1251,6 +1284,8 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
     required this.onFavToggle,
     required this.onClose,
     required this.onFullscreenChanged,
+    required this.onPrevious,
+    required this.onNext,
   });
 
   @override
@@ -1268,6 +1303,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
+
+  // Decoded frame size reported by VLC. Used to force the picture to fill the
+  // player box ourselves, because on iOS MobileVLCKit renders through its own
+  // layer and ignores the native `fit`/contentMode the plugin sets — so odd
+  // aspect-ratio channels would otherwise stay letterboxed no matter what.
+  Size? _videoSize;
 
   List<VlcTrackDescription> _audioTracks = [];
   List<VlcTrackDescription> _subtitleTracks = [];
@@ -1308,6 +1349,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _controller.dispose();
       _tracksLoaded = false;
       _errorText = null;
+      _videoSize = null;
       _selectedAudioTrackId = null;
       _selectedSubtitleTrackId = null;
       _audioTracks = [];
@@ -1367,6 +1409,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       setState(() {});
     }
 
+    // Track the decoded frame size so _buildVideoWidget can force the picture
+    // to fill the box. Only rebuild when it actually changes (once per stream).
+    if (value.videoSize != _videoSize) {
+      _videoSize = value.videoSize;
+      setState(() {});
+    }
+
     _loadTracksOnce();
   }
 
@@ -1414,32 +1463,22 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   void _showControlsTemporarily() {
     if (!mounted) return;
-    setState(() => _showControls = true);
+    // Skip the setState when controls are already visible so a drag start
+    // doesn't rebuild the whole player Stack for nothing.
+    if (!_showControls) setState(() => _showControls = true);
     _scheduleControlsHide();
   }
 
   Future<void> _togglePlayPause() async {
     _showControlsTemporarily();
-    final targetPlaying = !_isPlaying;
-    _isPlaying = targetPlaying;
-    _playingNotifier.value = targetPlaying;
-    if (mounted) setState(() {});
-
     try {
-      // Send exactly one native command. Do not recreate media or controller.
-      if (targetPlaying) {
-        await _controller.play();
-      } else {
-        await _controller.pause();
-      }
-      // Some VLC builds update value.isPlaying asynchronously; let the native
-      // listener correct the icon when the native state arrives.
+      // playOrPause() is a single native command that toggles based on VLC's
+      // own playback state. Separate play()/pause() calls driven by an
+      // optimistic local flag desync from the native listener on live
+      // streams, which is why the icon would flip back immediately.
+      await _controller.playOrPause();
     } catch (e) {
       debugPrint('VLC play/pause error: $e');
-      if (!mounted) return;
-      _isPlaying = !targetPlaying;
-      _playingNotifier.value = _isPlaying;
-      setState(() {});
     }
   }
 
@@ -1671,11 +1710,17 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-  Widget _buildVideoWidget(VlcVideoFit fit) {
+  Widget _buildVideoWidget() {
+    // Force the native side to `contain` so the picture letterboxes
+    // predictably inside the platform view on every platform. We then do the
+    // fill/crop ourselves with pure layout (an oversized box + clip). This is
+    // necessary because on iOS MobileVLCKit renders through its own layer and
+    // ignores the `fit`/contentMode the plugin sets, so channels whose source
+    // aspect ratio differs from the box would stay letterboxed forever.
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: fit,
+      fit: VlcVideoFit.contain,
     );
 
     switch (_selectedAspectRatio) {
@@ -1683,19 +1728,65 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         return Center(
           child: AspectRatio(
             aspectRatio: 16 / 9,
-            child: ClipRect(child: player),
+            child: _coverFill(player),
           ),
         );
       case '4:3':
         return Center(
           child: AspectRatio(
             aspectRatio: 4 / 3,
-            child: ClipRect(child: player),
+            child: _coverFill(player),
           ),
         );
       default:
-        return Positioned.fill(child: player);
+        return Positioned.fill(child: _coverFill(player));
     }
+  }
+
+  // Scales the video so it completely covers the available box, cropping any
+  // overflow while preserving the source aspect ratio (no distortion). Uses an
+  // oversized, centered box clipped to the target rect rather than a paint
+  // transform, because transforms on platform views are unreliable.
+  Widget _coverFill(Widget player) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final boxW = constraints.maxWidth;
+        final boxH = constraints.maxHeight;
+        final video = _videoSize;
+
+        if (!boxW.isFinite ||
+            !boxH.isFinite ||
+            boxW <= 0 ||
+            boxH <= 0 ||
+            video == null ||
+            video.width <= 0 ||
+            video.height <= 0) {
+          // VLC has not reported the frame size yet. Fill the box; native
+          // `contain` letterboxes for the brief moment until it arrives.
+          return ClipRect(child: SizedBox.expand(child: player));
+        }
+
+        // Smallest uniform scale that covers the whole box.
+        final scale = math.max(boxW / video.width, boxH / video.height);
+        final drawW = video.width * scale;
+        final drawH = video.height * scale;
+
+        return ClipRect(
+          child: OverflowBox(
+            alignment: Alignment.center,
+            minWidth: 0,
+            minHeight: 0,
+            maxWidth: double.infinity,
+            maxHeight: double.infinity,
+            child: SizedBox(
+              width: drawW,
+              height: drawH,
+              child: player,
+            ),
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -1706,8 +1797,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       fit: StackFit.expand,
       children: [
         // VLC video. The selected aspect ratio changes the actual widget
-        // bounds instead of merely cropping the source.
-        _buildVideoWidget(_currentFit),
+        // bounds; _coverFill then forces the picture to fill that box.
+        _buildVideoWidget(),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
@@ -1776,9 +1867,19 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       _playerIconButton(
+                        icon: Icons.skip_previous,
+                        tooltip: 'Previous Channel',
+                        onPressed: widget.onPrevious,
+                      ),
+                      _playerIconButton(
                         icon: _isPlaying ? Icons.pause : Icons.play_arrow,
                         tooltip: _isPlaying ? 'Pause' : 'Play',
                         onPressed: _togglePlayPause,
+                      ),
+                      _playerIconButton(
+                        icon: Icons.skip_next,
+                        tooltip: 'Next Channel',
+                        onPressed: widget.onNext,
                       ),
                       _playerIconButton(
                         icon: Icons.settings,
@@ -1872,9 +1973,6 @@ class _VideoGestureLayer extends StatefulWidget {
 class _VideoGestureLayerState extends State<_VideoGestureLayer> {
   static const double _minBrightness = 0.02;
   static const double _dragRangePx = 220.0;
-  // Skip platform calls for sub-perceptual brightness deltas so we don't
-  // spam the plugin channel on high-refresh displays.
-  static const double _brightnessEpsilon = 0.01;
 
   _GestureSide? _activeSide;
   double _startY = 0;
@@ -1884,7 +1982,8 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
 
   // In-flight guards: at most one native call per stream is pending, and
   // the latest requested value is replayed once the current call resolves.
-  // Prevents 60+ queued platform-channel calls during a fast drag.
+  // Prevents 60+ queued platform-channel calls during a fast drag while
+  // still guaranteeing the final finger position is applied.
   bool _volumeCallInFlight = false;
   int? _pendingVolume;
   bool _brightnessCallInFlight = false;
@@ -1910,6 +2009,10 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
     // Dragging up increases the value; dragging down decreases it.
     final delta = (_startY - d.globalPosition.dy) / _dragRangePx;
 
+    // Notifier is updated on EVERY value change so the on-screen indicator
+    // tracks the finger 1:1. Only the native call is throttled (via the
+    // in-flight guard below) — decoupling the two is what keeps the visual
+    // smooth even when the platform channel is slow.
     if (side == _GestureSide.volume) {
       final next = ((_startValue + delta) * 100).round().clamp(0, 100);
       if (next != widget.volumeNotifier.value) {
@@ -1918,9 +2021,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
       }
     } else {
       final next = (_startValue + delta).clamp(_minBrightness, 1.0);
-      if ((next - widget.brightnessNotifier.value).abs() >= _brightnessEpsilon ||
-          next == _minBrightness ||
-          next == 1.0) {
+      if (next != widget.brightnessNotifier.value) {
         widget.brightnessNotifier.value = next;
         _requestBrightness(next);
       }
@@ -1962,9 +2063,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
         _brightnessCallInFlight = false;
         final pending = _pendingBrightness;
         _pendingBrightness = null;
-        if (pending != null &&
-            (pending - b).abs() >= _brightnessEpsilon &&
-            mounted) {
+        if (pending != null && pending != b && mounted) {
           _requestBrightness(pending);
         }
       },
