@@ -1992,25 +1992,31 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // (initial load, channel switch, or resuming after a paused stop).
         // IgnorePointer so it never blocks the gesture or control layers.
         ValueListenableBuilder<VlcPlayerValue>(
-          valueListenable: _controller,
-          builder: (context, value, _) {
-            final loading = value.state == VlcPlaybackState.opening ||
-                value.state == VlcPlaybackState.buffering;
-            if (!loading) return const SizedBox.shrink();
-            return const IgnorePointer(
-              child: Center(
-                child: SizedBox(
-                  width: 46,
-                  height: 46,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 3.5,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                ),
-              ),
-            );
-          },
+  valueListenable: _controller,
+  builder: (context, value, _) {
+    // CHANGE THIS LINE: 
+    // Old logic: final loading = value.state == VlcPlaybackState.opening || value.state == VlcPlaybackState.buffering;
+    
+    // Fixed logic: If it is playing, it is NOT loading anymore.
+    final loading = (value.state == VlcPlaybackState.opening ||
+            value.state == VlcPlaybackState.buffering) &&
+        !value.isPlaying;
+        
+    if (!loading) return const SizedBox.shrink();
+    return const IgnorePointer(
+      child: Center(
+        child: SizedBox(
+          width: 46,
+          height: 46,
+          child: CircularProgressIndicator(
+            strokeWidth: 3.5,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+          ),
         ),
+      ),
+    );
+  },
+),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
