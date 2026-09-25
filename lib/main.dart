@@ -1567,27 +1567,28 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   void _playerListener() {
-    if (!mounted) return;
+  if (!mounted) return;
 
-    final value = _controller.value;
-    final playing = value.isPlaying;
+  final value = _controller.value;
+  final playing = value.isPlaying;
 
-    if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
-      if (_errorText != value.errorMessage) {
-        setState(() => _errorText = value.errorMessage);
-      }
+  // 1. Correctly catch native player errors
+  if (value.hasError) {
+    final err = value.errorDescription ?? "Unknown live stream connection error";
+    if (_errorText != err) {
+      setState(() => _errorText = err);
     }
-
-    // Do not call setState on every VLC update unless something actually
-    // changed. Excess rebuilds can interfere with native player controls.
-    if (_isPlaying != playing) {
-      _isPlaying = playing;
-      _playingNotifier.value = playing;
-      setState(() {});
-    }
-
-    _loadTracksOnce();
   }
+
+  if (_isPlaying != playing) {
+    _isPlaying = playing;
+    _playingNotifier.value = playing;
+    setState(() {});
+  }
+
+  _loadTracksOnce();
+}
+
 
   bool _tracksLoaded = false;
 
@@ -1988,29 +1989,30 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
-        // Buffering spinner: shown while VLC is opening/re-buffering the stream
-        // (initial load, channel switch, or resuming after a paused stop).
-        // IgnorePointer so it never blocks the gesture or control layers.
-        ValueListenableBuilder<VlcPlayerValue>(
-          valueListenable: _controller,
-          builder: (context, value, _) {
-            final loading = value.state == VlcPlaybackState.opening ||
-                value.state == VlcPlaybackState.buffering;
-            if (!loading) return const SizedBox.shrink();
-            return const IgnorePointer(
-              child: Center(
-                child: SizedBox(
-                  width: 46,
-                  height: 46,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 3.5,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                ),
-              ),
-            );
-          },
+        // Buffering spinner
+ValueListenableBuilder<VlcPlayerValue>(
+  valueListenable: _controller,
+  builder: (context, value, _) {
+    // Hide the loader if the stream has completely errored out
+    final loading = (value.state == VlcPlaybackState.opening ||
+        value.state == VlcPlaybackState.buffering) && !value.hasError;
+        
+    if (!loading) return const SizedBox.shrink();
+    return const IgnorePointer(
+      child: Center(
+        child: SizedBox(
+          width: 46,
+          height: 46,
+          child: CircularProgressIndicator(
+            strokeWidth: 3.5,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+          ),
         ),
+      ),
+    );
+  },
+),
+
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
