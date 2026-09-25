@@ -1567,27 +1567,27 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   void _playerListener() {
-    if (!mounted) return;
+  if (!mounted) return;
 
-    final value = _controller.value;
-    final playing = value.isPlaying;
+  final value = _controller.value;
+  final playing = value.isPlaying;
 
-    if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
-      if (_errorText != value.errorMessage) {
-        setState(() => _errorText = value.errorMessage);
-      }
+  if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
+    if (_errorText != value.errorMessage) {
+      setState(() => _errorText = value.errorMessage);
     }
-
-    // Do not call setState on every VLC update unless something actually
-    // changed. Excess rebuilds can interfere with native player controls.
-    if (_isPlaying != playing) {
-      _isPlaying = playing;
-      _playingNotifier.value = playing;
-      setState(() {});
-    }
-
-    _loadTracksOnce();
   }
+
+  // This ensures the spinner disappears the moment playing turns true!
+  if (_isPlaying != playing) {
+    _isPlaying = playing;
+    _playingNotifier.value = playing;
+    setState(() {});
+  }
+
+  _loadTracksOnce();
+}
+
 
   bool _tracksLoaded = false;
 
