@@ -2048,34 +2048,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
-        // Buffering spinner. It is driven by the dedicated buffering flag
-        // rather than directly by VLC's raw state, because some IPTV streams
-        // can report opening/buffering indefinitely. It is automatically hidden
-        // once playback starts and also has a 12-second watchdog.
-        ValueListenableBuilder<VlcPlayerValue>(
-          valueListenable: _controller,
-          builder: (context, value, _) {
-            final loading = _showBuffering &&
-                !value.isPlaying &&
-                !_userPaused &&
-                (value.state == VlcPlaybackState.opening ||
-                    value.state == VlcPlaybackState.buffering);
-            if (!loading) return const SizedBox.shrink();
-            return const IgnorePointer(
-              child: Center(
-                child: SizedBox(
-                  width: 46,
-                  height: 46,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 3.5,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
           volumeNotifier: _volumeNotifier,
