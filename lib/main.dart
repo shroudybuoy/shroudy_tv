@@ -1465,6 +1465,14 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   bool _userPaused = false;
   String? _errorText;
 
+  // Buffering overlay state is kept separately from VLC's raw playback state.
+  // Some live IPTV streams can leave VLC reporting opening/buffering even
+  // after the video is usable, or can remain in that state indefinitely.
+  // The watchdog prevents the spinner from becoming permanent.
+  bool _showBuffering = true;
+  Timer? _bufferingTimer;
+  static const Duration _bufferingWatchdog = Duration(seconds: 12);
+
   VlcVideoFit _currentFit = VlcVideoFit.fill;
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
@@ -1526,6 +1534,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _controller.dispose();
       _tracksLoaded = false;
       _errorText = null;
+      _showBuffering = true;
+      _bufferingTimer?.cancel();
       _selectedAudioTrackId = null;
       _selectedSubtitleTrackId = null;
       _audioTracks = [];
@@ -1563,31 +1573,70 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _controller.addListener(_playerListener);
     _isPlaying = true;
     _userPaused = false;
+    _showBuffering = true;
+    _scheduleBufferingWatchdog();
     _playingNotifier.value = true;
   }
 
-  void _playerListener() {
-  if (!mounted) return;
+  void _scheduleBufferingWatchdog() {
+    _bufferingTimer?.cancel();
+    if (!_showBuffering || _userPaused || !mounted) return;
+    _bufferingTimer = Timer(_bufferingWatchdog, () {
+      if (!mounted) return;
+      // If VLC has not reached a usable playing state after the watchdog
+      // period, stop showing the endless spinner. VLC continues attempting
+      // the stream in the background, so a later playing event can restore
+      // normal state without changing the UI.
+      if (!_controller.value.isPlaying && !_userPaused) {
+        setState(() => _showBuffering = false);
+      }
+    });
+  }
 
-  final value = _controller.value;
-  final playing = value.isPlaying;
-
-  if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
-    if (_errorText != value.errorMessage) {
-      setState(() => _errorText = value.errorMessage);
+  void _stopBufferingIndicator() {
+    _bufferingTimer?.cancel();
+    _bufferingTimer = null;
+    if (_showBuffering && mounted) {
+      setState(() => _showBuffering = false);
     }
   }
 
-  // This ensures the spinner disappears the moment playing turns true!
-  if (_isPlaying != playing) {
-    _isPlaying = playing;
-    _playingNotifier.value = playing;
-    setState(() {});
+  void _playerListener() {
+    if (!mounted) return;
+
+    final value = _controller.value;
+    final playing = value.isPlaying;
+
+    // isPlaying is the important signal here. A number of live IPTV inputs
+    // keep VLC's state at buffering/opening even though frames are already
+    // being rendered. Never keep the spinner over a stream that VLC reports
+    // as actually playing.
+    final loadingState = value.state == VlcPlaybackState.opening ||
+        value.state == VlcPlaybackState.buffering;
+    if (playing || !loadingState || _userPaused) {
+      _stopBufferingIndicator();
+    } else if (!_showBuffering) {
+      _showBuffering = true;
+      _scheduleBufferingWatchdog();
+      setState(() {});
+    }
+
+    if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
+      if (_errorText != value.errorMessage) {
+        setState(() => _errorText = value.errorMessage);
+      }
+    }
+
+    // Do not call setState on every VLC update unless something actually
+    // changed. Excess rebuilds can interfere with native player controls.
+    if (_isPlaying != playing) {
+      _isPlaying = playing;
+      _playingNotifier.value = playing;
+      setState(() {});
+    }
+
+    _loadTracksOnce();
   }
-
-  _loadTracksOnce();
-}
-
 
   bool _tracksLoaded = false;
 
@@ -1649,7 +1698,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       if (wantPause) {
         // Flip the UI immediately so the button feels responsive even before
         // the native state event arrives.
-        setState(() => _userPaused = true);
+        setState(() {
+          _userPaused = true;
+          _showBuffering = false;
+        });
+        _bufferingTimer?.cancel();
         await _controller.pause();
         // Live IPTV inputs frequently ignore pause() (canPause == false), so the
         // picture keeps running. Verify shortly after: if VLC is still active,
@@ -1662,7 +1715,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
           }
         });
       } else {
-        setState(() => _userPaused = false);
+        setState(() {
+          _userPaused = false;
+          _showBuffering = true;
+        });
+        _scheduleBufferingWatchdog();
         await _controller.play();
       }
     } catch (e) {
@@ -1903,6 +1960,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _shutDown = true;
     _controlsTimer?.cancel();
     _controlsTimer = null;
+    _bufferingTimer?.cancel();
+    _bufferingTimer = null;
     try {
       await _controller.stop();
     } catch (e) {
@@ -1926,6 +1985,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void dispose() {
     _controlsTimer?.cancel();
+    _bufferingTimer?.cancel();
     if (!_shutDown) {
       // Fallback for the rare path where the widget is removed without an
       // awaited shutdown(). Stop VLC before touching the shared audio session
@@ -1988,35 +2048,33 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         // bounds instead of merely cropping the source.
         _buildVideoWidget(_currentFit),
 
-        // Buffering spinner: shown while VLC is opening/re-buffering the stream
-        // (initial load, channel switch, or resuming after a paused stop).
-        // IgnorePointer so it never blocks the gesture or control layers.
+        // Buffering spinner. It is driven by the dedicated buffering flag
+        // rather than directly by VLC's raw state, because some IPTV streams
+        // can report opening/buffering indefinitely. It is automatically hidden
+        // once playback starts and also has a 12-second watchdog.
         ValueListenableBuilder<VlcPlayerValue>(
-  valueListenable: _controller,
-  builder: (context, value, _) {
-    // CHANGE THIS LINE: 
-    // Old logic: final loading = value.state == VlcPlaybackState.opening || value.state == VlcPlaybackState.buffering;
-    
-    // Fixed logic: If it is playing, it is NOT loading anymore.
-    final loading = (value.state == VlcPlaybackState.opening ||
-            value.state == VlcPlaybackState.buffering) &&
-        !value.isPlaying;
-        
-    if (!loading) return const SizedBox.shrink();
-    return const IgnorePointer(
-      child: Center(
-        child: SizedBox(
-          width: 46,
-          height: 46,
-          child: CircularProgressIndicator(
-            strokeWidth: 3.5,
-            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-          ),
+          valueListenable: _controller,
+          builder: (context, value, _) {
+            final loading = _showBuffering &&
+                !value.isPlaying &&
+                !_userPaused &&
+                (value.state == VlcPlaybackState.opening ||
+                    value.state == VlcPlaybackState.buffering);
+            if (!loading) return const SizedBox.shrink();
+            return const IgnorePointer(
+              child: Center(
+                child: SizedBox(
+                  width: 46,
+                  height: 46,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 3.5,
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                  ),
+                ),
+              ),
+            );
+          },
         ),
-      ),
-    );
-  },
-),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
