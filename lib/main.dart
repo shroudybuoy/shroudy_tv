@@ -1522,28 +1522,39 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-  @override
+    @override
   void didUpdateWidget(VideoCanvasPlayerLayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Channel switches used to be handled by giving the widget a
-    // ValueKey(streamUrl), which recreated the State. Now that the parent
-    // owns a stable GlobalKey across fullscreen transitions, we have to
-    // detect the URL change ourselves and rebuild the controller in place.
+    
     if (oldWidget.streamUrl != widget.streamUrl) {
-      _controller.removeListener(_playerListener);
-      _controller.dispose();
+      // 1. Snatch a structural reference to the stale controller before decoupling
+      final legacyController = _controller;
+      
+      // 2. Instantly scrub event hooks so incoming playback changes are ignored
+      legacyController.removeListener(_playerListener);
+      
+      // 3. FIX CRASH/FREEZE: Send an unawaited background instruction to kill the network stream
+      // This stops the platform channel from blocking the UI loop while it flushes buffers.
+      unawaited(
+        legacyController.stop().then((_) => legacyController.dispose()).catchError(
+          (Object e) => debugPrint('Background stream teardown failed: $e'),
+        ),
+      );
+
+      // 4. Reset state indices immediately so the loading view handles new targets cleanly
       _tracksLoaded = false;
       _errorText = null;
-      _showBuffering = true;
-      _bufferingTimer?.cancel();
       _selectedAudioTrackId = null;
       _selectedSubtitleTrackId = null;
       _audioTracks = [];
       _subtitleTracks = [];
+
+      // 5. Instantly build the fresh controller to handle the incoming layout switch
       _createController(widget.streamUrl);
       _showControlsTemporarily();
     }
   }
+
 
   Future<void> _syncInitialBrightness() async {
     try {
