@@ -771,28 +771,13 @@ class _MainDashboardState extends State<MainDashboard> {
     await prefs.setStringList('favorite_names', _favoritesList);
   }
 
-    void _setPlayerFullscreen(bool value) {
+  void _setPlayerFullscreen(bool value) {
     if (_isPlayerFullscreen == value) return;
     setState(() => _isPlayerFullscreen = value);
     SystemChrome.setEnabledSystemUIMode(
       value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
     );
-
-    // Give Flutter a frame to update constraints, then re-apply aspect ratio if needed
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      final playerState = _playerKey.currentState as _VideoCanvasPlayerLayerState?;
-      if (playerState != null && playerState._selectedAspectRatio == 'Fit to screen') {
-        try {
-          final size = MediaQuery.of(context).size;
-          final screenRatio = size.width / size.height;
-          await playerState._controller.setAspectRatio('${screenRatio.toStringAsFixed(3)}:1');
-        } catch (e) {
-          debugPrint('Fullscreen ratio adjustment error: $e');
-        }
-      }
-    });
   }
-
 
   // Leaves the player: runs an orderly, awaited native teardown (stop VLC, then
   // release the shared audio session) BEFORE the widget unmounts, so the iOS
@@ -819,6 +804,10 @@ class _MainDashboardState extends State<MainDashboard> {
       channelName: channel.name,
       isFavorited: _favoritesList.contains(channel.name),
       isFullscreen: isFullscreen,
+      // Always the whole screen, never the split-view pane: "Fit to screen"
+      // then keeps one VLC ratio for both layouts, so entering or leaving
+      // fullscreen does not have to reopen the stream.
+      screen: MediaQuery.sizeOf(context),
       onFavToggle: () => _toggleFavorite(channel.name),
       onClose: _closePlayer,
       onFullscreenChanged: _setPlayerFullscreen,
@@ -1446,6 +1435,12 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final String channelName;
   final bool isFavorited;
   final bool isFullscreen;
+
+  /// The size of the whole screen, in logical pixels. "Fit to screen" needs it
+  /// before VLC opens the stream, because the stretch ratio has to be part of
+  /// the media options of the very first load.
+  final Size screen;
+
   final VoidCallback onFavToggle;
   final VoidCallback onClose;
   final ValueChanged<bool> onFullscreenChanged;
@@ -1458,6 +1453,7 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
     required this.channelName,
     required this.isFavorited,
     required this.isFullscreen,
+    required this.screen,
     required this.onFavToggle,
     required this.onClose,
     required this.onFullscreenChanged,
@@ -1488,7 +1484,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Timer? _bufferingTimer;
   static const Duration _bufferingWatchdog = Duration(seconds: 12);
 
-  VlcVideoFit _currentFit = VlcVideoFit.fill;
+  // VLC can only stretch a picture to an explicit W:H, so the ratio used by
+  // "Fit to screen" is derived from the screen size. Changing it means
+  // reloading the media, which is debounced so a rotation reopens the stream
+  // once, after the layout settles.
+  String? _appliedAspectRatio;
+  Timer? _aspectReloadTimer;
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
@@ -1497,11 +1498,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   List<VlcTrackDescription> _subtitleTracks = [];
 
   Timer? _controlsTimer;
-
-  // This notifier lets the fullscreen route immediately receive aspect-ratio
-  // changes made in the settings dialog.
-  late final ValueNotifier<VlcVideoFit> _fitNotifier;
-  late final ValueNotifier<String> _aspectNotifier;
 
   // Shared gesture state so the normal and fullscreen views stay in sync.
   // Volume controls the real iOS device volume (0..100) via
@@ -1515,8 +1511,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void initState() {
     super.initState();
-    _fitNotifier = ValueNotifier<VlcVideoFit>(_currentFit);
-    _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
     _createController(widget.streamUrl);
     _showControlsTemporarily();
     _syncInitialBrightness();
@@ -1558,6 +1552,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _createController(widget.streamUrl);
       _showControlsTemporarily();
     }
+    if (oldWidget.screen != widget.screen) _scheduleAspectRatioReload();
   }
 
   Future<void> _syncInitialBrightness() async {
@@ -1570,18 +1565,93 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     }
   }
 
+  static const List<String> _baseMediaOptions = [
+    ':network-caching=1000',
+    ':live-caching=1000',
+    ':file-caching=1000',
+    ':http-reconnect=true',
+    ':clock-jitter=0',
+    ':clock-synchro=0',
+  ];
+
+  List<String> _mediaOptionsFor(String? aspectRatio) => [
+    ..._baseMediaOptions,
+    if (aspectRatio != null) ':aspect-ratio=$aspectRatio',
+  ];
+
+  // The W:H that VLC should render at, or null to leave VLC on the stream's own
+  // aspect ratio (which letterboxes inside the widget bounds).
+  String? _aspectRatioFor(String mode) {
+    switch (mode) {
+      case '16:9':
+        return '16:9';
+      case '4:3':
+        return '4:3';
+      default:
+        final box = widget.screen;
+        if (box.width <= 0 || box.height <= 0) return null;
+        // VLC parses this option as two integers, so scale to two decimals
+        // before reducing by the greatest common divisor.
+        final w = (box.width * 100).round();
+        final h = (box.height * 100).round();
+        if (w <= 0 || h <= 0) return null;
+        final gcd = w.gcd(h);
+        return '${w ~/ gcd}:${h ~/ gcd}';
+    }
+  }
+
+  void _scheduleAspectRatioReload() {
+    _aspectReloadTimer?.cancel();
+    _aspectReloadTimer = Timer(const Duration(milliseconds: 350), _reloadWithAspectRatio);
+  }
+
+  Future<void> _reloadWithAspectRatio() async {
+    if (!mounted || _shutDown) return;
+    final aspect = _aspectRatioFor(_selectedAspectRatio);
+    if (aspect == _appliedAspectRatio) return;
+    _appliedAspectRatio = aspect;
+    try {
+      await _controller.setMedia(
+        VlcMediaSource(
+          uri: Uri.parse(widget.streamUrl),
+          mediaOptions: _mediaOptionsFor(aspect),
+        ),
+        autoPlay: !_userPaused,
+      );
+      // Reloading the media also resets the track selection, and VLC only
+      // exposes the new input's tracks a moment after it starts opening it.
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      if (!mounted || _shutDown || _appliedAspectRatio != aspect) return;
+      await _applyTrackSelection();
+    } catch (e) {
+      debugPrint('Aspect ratio reload failed: $e');
+    }
+  }
+
+  Future<void> _applyTrackSelection() async {
+    final audioId = _selectedAudioTrackId;
+    final subtitleId = _selectedSubtitleTrackId;
+    try {
+      // A null audio id means "Default": leave VLC's own choice alone.
+      if (audioId != null) await _controller.setAudioTrack(audioId);
+      // Selecting "None" must actually disable subtitles.
+      if (subtitleId == null) {
+        await _controller.disableSubtitle();
+      } else {
+        await _controller.setSubtitleTrack(subtitleId);
+      }
+    } catch (e) {
+      debugPrint('Track selection error: $e');
+    }
+  }
+
   void _createController(String url) {
+    final aspect = _aspectRatioFor(_selectedAspectRatio);
+    _appliedAspectRatio = aspect;
     _controller = VlcPlayerController(
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
-        mediaOptions: const [
-          ':network-caching=1000',
-          ':live-caching=1000',
-          ':file-caching=1000',
-          ':http-reconnect=true',
-          ':clock-jitter=0',
-          ':clock-synchro=0',
-        ],
+        mediaOptions: _mediaOptionsFor(aspect),
       ),
       autoPlay: true,
     );
@@ -1920,52 +1990,21 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-    Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
-    VlcVideoFit newFit;
-
-    newFit = aspect == 'Fit to screen'
-        ? VlcVideoFit.fill
-        : VlcVideoFit.cover;
-
+  Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     if (mounted) {
       setState(() {
         _selectedAspectRatio = aspect;
         _selectedAudioTrackId = audioId;
         _selectedSubtitleTrackId = subtitleId;
-        _currentFit = newFit;
       });
     }
-    _fitNotifier.value = newFit;
-    _aspectNotifier.value = aspect;
+    // Debounced so the reload waits for the rebuild above to settle on the new
+    // mode, and is skipped entirely when the ratio did not actually change.
+    _scheduleAspectRatioReload();
 
-    try {
-      if (aspect == 'Fit to screen') {
-        // Fetch the active window size of the iPad screen
-        final size = MediaQuery.of(context).size;
-        final screenRatio = size.width / size.height;
-        // Pass the string format that native VLC expects (e.g., "1.433:1")
-        await _controller.setAspectRatio('${screenRatio.toStringAsFixed(3)}:1');
-      } else {
-        // Reset or apply specific constraints for explicit selections
-        await _controller.setAspectRatio(aspect);
-      }
-
-      if (audioId != null) {
-        await _controller.setAudioTrack(audioId);
-      }
-
-      if (subtitleId == null) {
-        await _controller.disableSubtitle();
-      } else {
-        await _controller.setSubtitleTrack(subtitleId);
-      }
-    } catch (e) {
-      debugPrint('Track selection error: $e');
-    }
-
+    await _applyTrackSelection();
     _showControlsTemporarily();
   }
-
 
   // True once shutdown() has torn down the native audio/VLC resources. dispose()
   // checks this so it does not repeat (and race) the same native calls.
@@ -1983,6 +2022,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _controlsTimer = null;
     _bufferingTimer?.cancel();
     _bufferingTimer = null;
+    _aspectReloadTimer?.cancel();
+    _aspectReloadTimer = null;
     try {
       await _controller.stop();
     } catch (e) {
@@ -2007,6 +2048,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   void dispose() {
     _controlsTimer?.cancel();
     _bufferingTimer?.cancel();
+    _aspectReloadTimer?.cancel();
     if (!_shutDown) {
       // Fallback for the rare path where the widget is removed without an
       // awaited shutdown(). Stop VLC before touching the shared audio session
@@ -2021,8 +2063,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
       );
     }
-    _fitNotifier.dispose();
-    _aspectNotifier.dispose();
     _playingNotifier.dispose();
     _volumeNotifier.dispose();
     _brightnessNotifier.dispose();
@@ -2031,35 +2071,27 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-    Widget _buildVideoWidget(VlcVideoFit fit) {
+  Widget _buildVideoWidget() {
+    // `fit` is deliberately constant: vlc_player keys its native view on it, so
+    // changing it tears the view down and VLC re-opens the live stream. It is
+    // also ignored on iOS, where the native view keeps the source aspect ratio
+    // no matter what contentMode is set. Aspect handling is done entirely with
+    // VLC's :aspect-ratio media option plus the bounds chosen here.
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: fit,
+      fit: VlcVideoFit.contain,
     );
 
     switch (_selectedAspectRatio) {
       case '16:9':
-        return Center(
-          child: AspectRatio(
-            aspectRatio: 16 / 9,
-            child: ClipRect(child: player),
-          ),
-        );
+        return Center(child: AspectRatio(aspectRatio: 16 / 9, child: player));
       case '4:3':
-        return Center(
-          child: AspectRatio(
-            aspectRatio: 4 / 3,
-            child: ClipRect(child: player),
-          ),
-        );
-      default: // True layout fill for screen dimensions
-        return Positioned.fill(
-          child: SizedBox.expand(child: player),
-        );
+        return Center(child: AspectRatio(aspectRatio: 4 / 3, child: player));
+      default:
+        return Positioned.fill(child: player);
     }
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -2068,9 +2100,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // VLC video. The selected aspect ratio changes the actual widget
-        // bounds instead of merely cropping the source.
-        _buildVideoWidget(_currentFit),
+        // VLC video.
+        _buildVideoWidget(),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
