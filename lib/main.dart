@@ -771,13 +771,28 @@ class _MainDashboardState extends State<MainDashboard> {
     await prefs.setStringList('favorite_names', _favoritesList);
   }
 
-  void _setPlayerFullscreen(bool value) {
+    void _setPlayerFullscreen(bool value) {
     if (_isPlayerFullscreen == value) return;
     setState(() => _isPlayerFullscreen = value);
     SystemChrome.setEnabledSystemUIMode(
       value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
     );
+
+    // Give Flutter a frame to update constraints, then re-apply aspect ratio if needed
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final playerState = _playerKey.currentState as _VideoCanvasPlayerLayerState?;
+      if (playerState != null && playerState._selectedAspectRatio == 'Fit to screen') {
+        try {
+          final size = MediaQuery.of(context).size;
+          final screenRatio = size.width / size.height;
+          await playerState._controller.setAspectRatio('${screenRatio.toStringAsFixed(3)}:1');
+        } catch (e) {
+          debugPrint('Fullscreen ratio adjustment error: $e');
+        }
+      }
+    });
   }
+
 
   // Leaves the player: runs an orderly, awaited native teardown (stop VLC, then
   // release the shared audio session) BEFORE the widget unmounts, so the iOS
@@ -2010,13 +2025,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-  Widget _buildVideoWidget(VlcVideoFit fit) {
-    final player = SizedBox.expand(
-      child: VlcPlayer(
-        controller: _controller,
-        backgroundColor: Colors.black,
-        fit: fit,
-      ),
+    Widget _buildVideoWidget(VlcVideoFit fit) {
+    final player = VlcPlayer(
+      controller: _controller,
+      backgroundColor: Colors.black,
+      fit: fit,
     );
 
     switch (_selectedAspectRatio) {
@@ -2034,10 +2047,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
             child: ClipRect(child: player),
           ),
         );
-      default: // 'Fit to screen' configuration
-        return Positioned.fill(child: player);
+      default: // True layout fill for screen dimensions
+        return Positioned.fill(
+          child: SizedBox.expand(child: player),
+        );
     }
   }
+
 
   @override
   Widget build(BuildContext context) {
