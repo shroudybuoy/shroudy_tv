@@ -1500,6 +1500,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void initState() {
     super.initState();
+    _currentFit = VlcVideoFit.fill;
     _fitNotifier = ValueNotifier<VlcVideoFit>(_currentFit);
     _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
     _createController(widget.streamUrl);
