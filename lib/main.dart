@@ -2011,10 +2011,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   Widget _buildVideoWidget(VlcVideoFit fit) {
-    final player = VlcPlayer(
-      controller: _controller,
-      backgroundColor: Colors.black,
-      fit: fit,
+    final player = SizedBox.expand(
+      child: VlcPlayer(
+        controller: _controller,
+        backgroundColor: Colors.black,
+        fit: fit,
+      ),
     );
 
     switch (_selectedAspectRatio) {
@@ -2032,7 +2034,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
             child: ClipRect(child: player),
           ),
         );
-      default:
+      default: // 'Fit to screen' configuration
         return Positioned.fill(child: player);
     }
   }
