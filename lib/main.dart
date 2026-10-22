@@ -1,12 +1,23 @@
-import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:http/http.dart' as http;
+import 'package:screen_brightness/screen_brightness.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vlc_player/vlc_player.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Keep channel logos in memory for the whole app session so each one is
+  // downloaded once and never re-fetched until the app is closed. Flutter's
+  // ImageCache is in-memory only (cleared on process exit) and is what
+  // Image.network uses under the hood.
+  PaintingBinding.instance.imageCache.maximumSize = 2000;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20; // 256 MB
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -30,13 +41,163 @@ class ChannelItem {
   final String logoUrl;
   final String streamUrl;
   final String category;
+  final String tvgId;
 
   ChannelItem({
     required this.name,
     required this.logoUrl,
     required this.streamUrl,
     required this.category,
+    required this.tvgId,
   });
+}
+
+class EpgProgram {
+  final DateTime start;
+  final DateTime stop;
+  final String title;
+  final String description;
+  final String? imageUrl;
+
+  const EpgProgram({
+    required this.start,
+    required this.stop,
+    required this.title,
+    this.description = '',
+    this.imageUrl,
+  });
+}
+
+class EpgData {
+  final EpgProgram? now;
+  final EpgProgram? next;
+  final List<EpgProgram> upcoming;
+
+  const EpgData({
+    this.now,
+    this.next,
+    this.upcoming = const [],
+  });
+}
+
+/// Animated boot/splash screen shown while the playlist and channel logos load.
+class BootSplash extends StatefulWidget {
+  const BootSplash({super.key});
+
+  @override
+  State<BootSplash> createState() => _BootSplashState();
+}
+
+class _BootSplashState extends State<BootSplash> with TickerProviderStateMixin {
+  // Gentle "breathing" pulse on the logo badge.
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1300),
+  )..repeat(reverse: true);
+
+  // One-shot entrance for the whole composition.
+  late final AnimationController _entrance = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    _entrance.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fade = CurvedAnimation(parent: _entrance, curve: Curves.easeOut);
+    final rise = Tween<Offset>(
+      begin: const Offset(0, 0.12),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _entrance, curve: Curves.easeOutCubic));
+    final scale = Tween<double>(begin: 0.86, end: 1.0).animate(
+      CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+    );
+
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [ShroudyColors.darkNavyBg, ShroudyColors.cardNavyBg],
+          ),
+        ),
+        child: Center(
+          child: FadeTransition(
+            opacity: fade,
+            child: SlideTransition(
+              position: rise,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ScaleTransition(
+                    scale: scale,
+                    child: Container(
+                      width: 96,
+                      height: 96,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [ShroudyColors.primaryRed, Color(0xFFB91C1C)],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: ShroudyColors.primaryRed.withAlpha(115),
+                            blurRadius: 34,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(Icons.live_tv, color: Colors.white, size: 46),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  const Text(
+                    'SHROUDY TV',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 30,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 6,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'i O S',
+                    style: TextStyle(
+                      color: Colors.white.withAlpha(150),
+                      fontSize: 13,
+                      letterSpacing: 4,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 36),
+                  SizedBox(
+                    width: 150,
+                    child: LinearProgressIndicator(
+                      minHeight: 3,
+                      backgroundColor: Colors.white.withAlpha(30),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        ShroudyColors.primaryRed,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class ShroudyTvApp extends StatelessWidget {
@@ -45,7 +206,7 @@ class ShroudyTvApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Shroudy TV iPad',
+      title: 'Shroudy TV ios',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         scaffoldBackgroundColor: ShroudyColors.darkNavyBg,
@@ -71,11 +232,36 @@ class _MainDashboardState extends State<MainDashboard> {
   String _searchQuery = '';
   ChannelItem? _currentChannel;
   bool _isLoading = true;
+  final Map<String, EpgData> _epgByChannel = {};
+  Timer? _epgRefreshTimer;
+  String? _playlistEpgUrl;
+
+  // Boot splash timing: keep it on screen for at least _minBootDuration so the
+  // animation plays out even when the playlist loads almost instantly.
+  final DateTime _bootStart = DateTime.now();
+  static const Duration _minBootDuration = Duration(milliseconds: 2200);
+
+  // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
+  // that toggling it only changes the layout around the player. The player
+  // widget itself is kept alive via _playerKey across the transition, which
+  // prevents VLC from tearing down its native surface and re-buffering the
+  // live stream.
+  bool _isPlayerFullscreen = false;
+  final GlobalKey _playerKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
     _fetchM3uPlaylist();
+    _epgRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) => _refreshCurrentEpg());
+  }
+
+  // Waits out the remaining minimum boot time (if any), then reveals the UI.
+  Future<void> _finishBoot() async {
+    final remaining = _minBootDuration - DateTime.now().difference(_bootStart);
+    if (remaining > Duration.zero) await Future.delayed(remaining);
+    if (!mounted) return;
+    setState(() => _isLoading = false);
   }
 
   Future<void> _fetchM3uPlaylist() async {
@@ -89,7 +275,20 @@ class _MainDashboardState extends State<MainDashboard> {
         String currentName = '';
         String currentLogo = '';
         String currentCategory = 'Uncategorized';
+        String currentTvgId = '';
         final categoriesSet = <String>{};
+
+        // Use the EPG URL declared by the playlist header.
+        for (final raw in lines.take(10)) {
+          final header = raw.trim();
+          if (header.toUpperCase().startsWith('#EXTM3U')) {
+            final declaredEpg = _extractAttribute(header, 'x-tvg-url');
+            if (declaredEpg.isNotEmpty) {
+              _playlistEpgUrl = declaredEpg;
+              break;
+            }
+          }
+        }
 
         for (var line in lines) {
           final cleanLine = line.trim().replaceAll('\r', '');
@@ -107,6 +306,7 @@ class _MainDashboardState extends State<MainDashboard> {
 
             currentLogo = _extractAttribute(cleanLine, 'logo');
             currentCategory = _extractAttribute(cleanLine, 'group-title');
+            currentTvgId = _extractAttribute(cleanLine, 'tvg-id');
 
             if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
             categoriesSet.add(currentCategory);
@@ -118,10 +318,12 @@ class _MainDashboardState extends State<MainDashboard> {
                   logoUrl: currentLogo,
                   streamUrl: cleanLine,
                   category: currentCategory,
+                  tvgId: currentTvgId,
                 ),
               );
               currentName = '';
               currentLogo = '';
+              currentTvgId = '';
             }
           }
         }
@@ -133,15 +335,423 @@ class _MainDashboardState extends State<MainDashboard> {
         setState(() {
           _favoritesList.addAll(savedFavs);
           _categoriesList.addAll(categoriesSet.toList()..sort());
-          _isLoading = false;
         });
+        _fetchEpg();
+        await _finishBoot();
       } else {
-        if (mounted) setState(() => _isLoading = false);
+        await _finishBoot();
       }
     } catch (e) {
       debugPrint('Playlist error: $e');
-      if (mounted) setState(() => _isLoading = false);
+      await _finishBoot();
     }
+  }
+
+
+  DateTime? _parseXmltvDate(String? raw) {
+    if (raw == null) return null;
+    final value = raw.trim();
+    try {
+      return DateTime.parse(value).toLocal();
+    } catch (_) {}
+
+    // XMLTV commonly uses: yyyyMMddHHmmss +0000 / yyyyMMddHHmmss -0500
+    final match = RegExp(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?$').firstMatch(value);
+    if (match == null) return null;
+
+    final year = int.parse(match.group(1)!);
+    final month = int.parse(match.group(2)!);
+    final day = int.parse(match.group(3)!);
+    final hour = int.parse(match.group(4)!);
+    final minute = int.parse(match.group(5)!);
+    final second = int.parse(match.group(6)!);
+    final sign = match.group(7);
+    final tzHour = int.tryParse(match.group(8) ?? '0') ?? 0;
+    final tzMinute = int.tryParse(match.group(9) ?? '0') ?? 0;
+
+    if (sign == null) {
+      return DateTime(year, month, day, hour, minute, second);
+    }
+
+    final offset = Duration(hours: tzHour, minutes: tzMinute);
+    final utc = DateTime.utc(year, month, day, hour, minute, second);
+    return (sign == '+') ? utc.subtract(offset).toLocal() : utc.add(offset).toLocal();
+  }
+
+  String _normalizeEpgName(String value) {
+    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
+    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
+    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
+  }
+
+  String _epgNameKey(String value) {
+    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
+    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
+    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+
+    // Normalize common provider/channel-name differences so the same
+    // channel can be matched even when M3U and XMLTV use different labels.
+    v = v.replaceAll(RegExp(r'\bfull hd\b'), ' ');
+    v = v.replaceAll(RegExp(r'\bhigh definition\b'), ' ');
+    v = v.replaceAll(RegExp(r'\b(\d+\s*)?(hd|sd)\b'), ' ');
+    v = v.replaceAll(RegExp(r'\b(india|indian|tv channel|channel)\b'), ' ');
+    v = v.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
+  }
+
+  String _decodeXmlText(String value) {
+    return value
+        .replaceAll('&amp;', '&')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.tryParse(m.group(1)!) ?? 32));
+  }
+
+  String _cleanEpgText(String value) {
+    return _decodeXmlText(value.replaceAll(RegExp(r'<[^>]+>'), '').trim());
+  }
+
+  String _englishXmlText(String body, String tag) {
+    final matches = RegExp(
+      '<$tag\\b([^>]*)>(.*?)</$tag\\s*>',
+      caseSensitive: false,
+      dotAll: true,
+    ).allMatches(body);
+
+    String? firstText;
+    for (final match in matches) {
+      final attrs = match.group(1) ?? '';
+      final text = _cleanEpgText(match.group(2) ?? '');
+      if (text.isEmpty) continue;
+      firstText ??= text;
+
+      final langMatch = RegExp(
+        r'''\blang\s*=\s*["']([^"']+)["']''',
+        caseSensitive: false,
+      ).firstMatch(attrs);
+      final lang = langMatch?.group(1)?.toLowerCase() ?? '';
+
+      if (lang == 'en' ||
+          lang.startsWith('en-') ||
+          lang.startsWith('en_') ||
+          lang == 'eng' ||
+          lang == 'english') {
+        return text;
+      }
+    }
+    return firstText ?? '';
+  }
+
+  String? _xmlIconUrl(String body) {
+    final match = RegExp(
+      r'''<icon\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>''',
+      caseSensitive: false,
+    ).firstMatch(body);
+    final value = match?.group(1)?.trim();
+    return value == null || value.isEmpty ? null : _decodeXmlText(value);
+  }
+
+  Future<void> _fetchEpg() async {
+    final urls = <String>[
+      if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
+      'https://iptv-org.github.io/epg/guides/in.xml.gz',
+      'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
+      'https://iptv-epg.org/files/epg-in.xml.gz',
+    ].toSet().toList();
+
+    // Do NOT stop after the first working EPG source.
+    // A source can be reachable but contain only a small subset of channels.
+    // We merge matches from every source so sparse EPG files can fill gaps.
+    final merged = <String, EpgData>{};
+
+    EpgData buildData(List<EpgProgram>? source) {
+      if (source == null || source.isEmpty) {
+        return const EpgData();
+      }
+
+      final sorted = List<EpgProgram>.from(source)
+        ..sort((a, b) => a.start.compareTo(b.start));
+
+      final now = DateTime.now();
+      EpgProgram? current;
+      final future = <EpgProgram>[];
+
+      for (final program in sorted) {
+        if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
+          current ??= program;
+        } else if (program.start.isAfter(now)) {
+          future.add(program);
+        }
+      }
+
+      return EpgData(
+        now: current,
+        next: future.isNotEmpty ? future.first : null,
+        upcoming: future.take(6).toList(),
+      );
+    }
+
+    bool hasUsefulData(EpgData data) =>
+        data.now != null || data.next != null || data.upcoming.isNotEmpty;
+
+    EpgProgram? mergeProgram(EpgProgram? preferred, EpgProgram? fallback) {
+      if (preferred == null) return fallback;
+      if (fallback == null) return preferred;
+      return EpgProgram(
+        start: preferred.start,
+        stop: preferred.stop,
+        title: preferred.title,
+        description: preferred.description.isNotEmpty
+            ? preferred.description
+            : fallback.description,
+        imageUrl: preferred.imageUrl?.isNotEmpty == true
+            ? preferred.imageUrl
+            : fallback.imageUrl,
+      );
+    }
+
+    EpgData mergeData(EpgData oldData, EpgData newData) {
+      final now = mergeProgram(newData.now, oldData.now);
+      final next = mergeProgram(newData.next, oldData.next);
+
+      final allUpcoming = <String, EpgProgram>{};
+      for (final p in oldData.upcoming) {
+        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
+      }
+      for (final p in newData.upcoming) {
+        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
+      }
+
+      final upcoming = allUpcoming.values.toList()
+        ..sort((a, b) => a.start.compareTo(b.start));
+
+      return EpgData(
+        now: now,
+        next: next,
+        upcoming: upcoming.take(6).toList(),
+      );
+    }
+
+    for (final url in urls) {
+      try {
+        final response = await http
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 25));
+
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          debugPrint('EPG source HTTP ${response.statusCode}: $url');
+          continue;
+        }
+
+        String xml;
+        final bytes = response.bodyBytes;
+        if (bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+          xml = utf8.decode(GZipCodec().decode(bytes), allowMalformed: true);
+        } else {
+          xml = utf8.decode(bytes, allowMalformed: true);
+        }
+
+        final channelNames = <String, String>{};
+
+        final channelRegex = RegExp(
+          r'<channel\b[^>]*\bid\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r'][^>]*>(.*?)</channel\s*>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+
+        final displayRegex = RegExp(
+          r'<display-name\b[^>]*>(.*?)</display-name\s*>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+
+        for (final m in channelRegex.allMatches(xml)) {
+          final id = m.group(1)!.trim();
+          final body = m.group(2)!;
+          final dm = displayRegex.firstMatch(body);
+          if (dm != null) {
+            channelNames[id] = _decodeXmlText(
+              dm.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim(),
+            );
+          }
+        }
+
+        final programmes = <String, List<EpgProgram>>{};
+
+        // Match programme elements regardless of attribute ordering and
+        // support both single- and double-quoted XML attributes.
+        final programmeRegex = RegExp(
+          r'<programme\b([^>]*)>(.*?)</programme\s*>',
+          caseSensitive: false,
+          dotAll: true,
+        );
+
+        final channelAttr = RegExp(
+          r'\bchannel\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        final attrStart = RegExp(
+          r'\bstart\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        final attrStop = RegExp(
+          r'\bstop\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
+          caseSensitive: false,
+        );
+        for (final m in programmeRegex.allMatches(xml)) {
+          final attrs = m.group(1)!;
+          final body = m.group(2)!;
+
+          final channelId = channelAttr.firstMatch(attrs)?.group(1)?.trim();
+          final startRaw = attrStart.firstMatch(attrs)?.group(1);
+          final stopRaw = attrStop.firstMatch(attrs)?.group(1);
+
+          if (channelId == null ||
+              channelId.isEmpty ||
+              startRaw == null ||
+              stopRaw == null) {
+            continue;
+          }
+
+          final start = _parseXmltvDate(startRaw);
+          final stop = _parseXmltvDate(stopRaw);
+          if (start == null || stop == null || !stop.isAfter(start)) continue;
+
+          // Prefer the English XMLTV title when the provider supplies one.
+          // If no English field exists, retain the provider's first title.
+          final title = _englishXmlText(body, 'title');
+          if (title.isEmpty) continue;
+
+          final description = _englishXmlText(body, 'desc');
+          final imageUrl = _xmlIconUrl(body);
+
+          (programmes[channelId] ??= []).add(
+            EpgProgram(
+              start: start,
+              stop: stop,
+              title: title,
+              description: description,
+              imageUrl: imageUrl,
+            ),
+          );
+        }
+
+        // Create a normalized display-name index for this source.
+        final byName = <String, List<EpgProgram>>{};
+        programmes.forEach((id, list) {
+          final display = channelNames[id];
+          if (display == null || display.trim().isEmpty) return;
+
+          final key = _epgNameKey(display);
+          if (key.isNotEmpty) {
+            (byName[key] ??= <EpgProgram>[]).addAll(list);
+          }
+        });
+
+        for (final channel in _allChannelsList) {
+          final resultKey = channel.tvgId.trim().isNotEmpty
+              ? channel.tvgId.trim()
+              : channel.name;
+
+          List<EpgProgram>? matched;
+
+          // 1. Exact tvg-id match.
+          final id = channel.tvgId.trim();
+          if (id.isNotEmpty) {
+            matched = programmes[id];
+            if (matched == null) {
+              for (final entry in programmes.entries) {
+                if (entry.key.toLowerCase() == id.toLowerCase()) {
+                  matched = entry.value;
+                  break;
+                }
+              }
+            }
+          }
+
+          // 2. Exact normalized channel-name match.
+          final channelKey = _epgNameKey(channel.name);
+          matched ??= byName[channelKey];
+
+          // 3. Fuzzy normalized-name match for provider naming differences.
+          if (matched == null && channelKey.isNotEmpty) {
+            int bestScore = 0;
+            for (final entry in byName.entries) {
+              final epgKey = entry.key;
+              int score = 0;
+
+              if (epgKey == channelKey) {
+                score = 100;
+              } else if (epgKey.contains(channelKey) || channelKey.contains(epgKey)) {
+                score = 80;
+              } else {
+                final channelTokens = _epgTokens(channelKey);
+                final epgTokens = _epgTokens(epgKey);
+                final overlap = channelTokens.intersection(epgTokens).length;
+                if (overlap >= 2) score = 50 + overlap;
+              }
+
+              if (score > bestScore) {
+                bestScore = score;
+                matched = entry.value;
+              }
+            }
+          }
+
+          if (matched == null || matched.isEmpty) continue;
+
+          final data = buildData(matched);
+          if (!hasUsefulData(data)) continue;
+
+          final previous = merged[resultKey];
+          merged[resultKey] =
+              previous == null ? data : mergeData(previous, data);
+        }
+
+        debugPrint(
+          'EPG source parsed: ${programmes.length} XMLTV IDs, '
+          '${merged.length} matched playlist channels from $url',
+        );
+      } catch (e) {
+        debugPrint('EPG source failed $url: $e');
+      }
+    }
+
+    if (!mounted) return;
+
+    setState(() {
+      _epgByChannel
+        ..clear()
+        ..addAll(merged);
+    });
+
+    debugPrint('EPG merged: ${merged.length}/${_allChannelsList.length} channels');
+  }
+
+  Set<String> _epgTokens(String value) {
+    final ignored = <String>{
+      'tv', 'television', 'channel', 'india', 'hd', 'sd',
+      'english', 'hindi', 'live', 'network',
+    };
+
+    return value
+        .split(RegExp(r'[^a-z0-9]+'))
+        .where((e) => e.length >= 2 && !ignored.contains(e))
+        .toSet();
+  }
+
+  Future<void> _refreshCurrentEpg() async {
+    if (_allChannelsList.isNotEmpty) await _fetchEpg();
+  }
+
+  @override
+  void dispose() {
+    _epgRefreshTimer?.cancel();
+    super.dispose();
   }
 
   String _extractAttribute(String line, String attributeName) {
@@ -161,27 +771,128 @@ class _MainDashboardState extends State<MainDashboard> {
     await prefs.setStringList('favorite_names', _favoritesList);
   }
 
+  void _setPlayerFullscreen(bool value) {
+    if (_isPlayerFullscreen == value) return;
+    setState(() => _isPlayerFullscreen = value);
+    SystemChrome.setEnabledSystemUIMode(
+      value ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
+  // Leaves the player: runs an orderly, awaited native teardown (stop VLC, then
+  // release the shared audio session) BEFORE the widget unmounts, so the iOS
+  // main thread is never left tearing down a live audio session mid-frame.
+  Future<void> _closePlayer() async {
+    final playerState =
+        _playerKey.currentState as _VideoCanvasPlayerLayerState?;
+    await playerState?.shutdown();
+    if (!mounted) return;
+    _setPlayerFullscreen(false);
+    setState(() => _currentChannel = null);
+  }
+
+  // Single widget instance reused by both the split view and the fullscreen
+  // body. The stable GlobalKey is what lets Flutter reparent the Element
+  // (and its underlying VLC platform view) between the two layouts without
+  // destroying and recreating it.
+  Widget _buildPlayer({required bool isFullscreen}) {
+    final channel = _currentChannel;
+    if (channel == null) return const SizedBox.shrink();
+    return VideoCanvasPlayerLayer(
+      key: _playerKey,
+      streamUrl: channel.streamUrl,
+      channelName: channel.name,
+      isFavorited: _favoritesList.contains(channel.name),
+      isFullscreen: isFullscreen,
+      onFavToggle: () => _toggleFavorite(channel.name),
+      onClose: _closePlayer,
+      onFullscreenChanged: _setPlayerFullscreen,
+      onPrevious: _playPreviousChannel,
+      onNext: _playNextChannel,
+    );
+  }
+
+  List<ChannelItem> _getFilteredChannels() {
+    final query = _searchQuery.trim().toLowerCase();
+    bool matchesSearch(ChannelItem ch) =>
+        query.isEmpty || ch.name.toLowerCase().contains(query);
+
+    // The Favorites tab stays scoped to favorites even while searching.
+    if (_selectedCategory == '★ Favorites') {
+      return _allChannelsList
+          .where((ch) => _favoritesList.contains(ch.name) && matchesSearch(ch))
+          .toList();
+    }
+
+    // A non-empty search is global: it spans every category, not just the
+    // selected tab, so a channel is found no matter which category it lives in.
+    if (query.isNotEmpty) {
+      return _allChannelsList.where(matchesSearch).toList();
+    }
+
+    // No search: fall back to the selected category (or all).
+    return _allChannelsList
+        .where((ch) =>
+            _selectedCategory == 'All' || ch.category == _selectedCategory)
+        .toList();
+  }
+
+  // Switches to the previous/next channel within the list the user is
+  // currently browsing, wrapping around at the ends. If the playing channel
+  // is no longer in that filtered list, we fall back to the full channel list
+  // so the buttons never dead-end.
+  void _stepChannel(int delta) {
+    final current = _currentChannel;
+    if (current == null) return;
+
+    var channels = _getFilteredChannels();
+    var index = channels.indexWhere((ch) => ch.streamUrl == current.streamUrl);
+    if (index == -1) {
+      channels = _allChannelsList;
+      index = channels.indexWhere((ch) => ch.streamUrl == current.streamUrl);
+    }
+    if (channels.isEmpty || index == -1) return;
+
+    final nextIndex = (index + delta) % channels.length;
+    setState(() => _currentChannel = channels[nextIndex]);
+  }
+
+  void _playPreviousChannel() => _stepChannel(-1);
+
+  void _playNextChannel() => _stepChannel(1);
+
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator(color: ShroudyColors.primaryRed)),
-      );
+      return const BootSplash();
     }
 
-    final filteredChannels = _allChannelsList.where((ch) {
-      final matchesSearch = ch.name.toLowerCase().contains(_searchQuery.toLowerCase());
-      if (_selectedCategory == '★ Favorites') {
-        return _favoritesList.contains(ch.name) && matchesSearch;
-      }
-      final matchesCat = _selectedCategory == 'All' || ch.category == _selectedCategory;
-      return matchesCat && matchesSearch;
-    }).toList();
+    final filteredChannels = _getFilteredChannels();
 
-    return Scaffold(
-      body: _currentChannel != null
-          ? _buildPremiumSplitPlayerLayoutView(filteredChannels)
-          : _buildStandardBrowsingHubView(filteredChannels),
+    Widget body;
+    if (_currentChannel == null) {
+      body = _buildStandardBrowsingHubView(filteredChannels);
+    } else if (_isPlayerFullscreen) {
+      // Same widget instance (same GlobalKey) as inside the split view, so
+      // its Element — and the VLC platform view under it — is reparented
+      // rather than recreated. That is what keeps the live stream playing
+      // through the fullscreen transition.
+      body = ColoredBox(
+        color: Colors.black,
+        child: _buildPlayer(isFullscreen: true),
+      );
+    } else {
+      body = _buildPremiumSplitPlayerLayoutView(filteredChannels);
+    }
+
+    return PopScope(
+      canPop: !_isPlayerFullscreen,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && _isPlayerFullscreen) {
+          _setPlayerFullscreen(false);
+        }
+      },
+      child: Scaffold(body: body),
     );
   }
   Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
@@ -287,6 +998,308 @@ class _MainDashboardState extends State<MainDashboard> {
       ),
     );
   }
+  Widget _buildEpgPanel(ChannelItem channel) {
+    final epgKey = channel.tvgId.trim().isNotEmpty
+        ? channel.tvgId.trim()
+        : channel.name;
+    final data = _epgByChannel[epgKey];
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Center(
+            child: Text(
+              'YOU ARE WATCHING',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Center(
+            child: Container(
+              width: 110,
+              height: 76,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: ShroudyColors.innerLogoBg,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: ShroudyColors.accentBorder),
+              ),
+              child: channel.logoUrl.trim().isEmpty
+                  ? const Icon(Icons.tv, color: Colors.white, size: 34)
+                  : Image.network(
+                      channel.logoUrl,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.tv, color: Colors.white, size: 34),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Center(
+            child: Text(
+              channel.name,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          const SizedBox(height: 18),
+          const Text(
+            'PROGRAMME GUIDE',
+            style: TextStyle(
+              color: Color.fromARGB(255, 71, 24, 243),
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          if (data?.now != null)
+            _buildLiveNowCard(data!.now!, channel.logoUrl)
+          else
+            const Text(
+              'No LIVE NOW programme found.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+
+          const SizedBox(height: 16),
+
+          if (data?.next != null) ...[
+            const Text(
+              'NEXT',
+              style: TextStyle(
+                color: Colors.orangeAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 6),
+            _buildEpgProgrammeRow(data!.next!, channel.logoUrl),
+          ],
+
+          const SizedBox(height: 18),
+
+          if (data?.upcoming.isNotEmpty == true) ...[
+            const Text(
+              'UPCOMING',
+              style: TextStyle(
+                color: Colors.lightBlueAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ...data!.upcoming.skip(1).take(5).map(
+              (program) => _buildEpgProgrammeRow(program, channel.logoUrl),
+            ),
+          ] else if (data != null) ...[
+            const Text(
+              'No additional upcoming programmes found.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+
+          if (data == null) ...[
+            const SizedBox(height: 10),
+            const Text(
+              'EPG is loading or this channel could not be matched.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLiveNowCard(EpgProgram program, String channelLogoUrl) {
+    final imageUrl = (program.imageUrl?.trim().isNotEmpty == true)
+        ? program.imageUrl!.trim()
+        : channelLogoUrl.trim();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: ShroudyColors.innerLogoBg,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.greenAccent.withAlpha(100)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'LIVE NOW',
+            style: TextStyle(
+              color: Color.fromARGB(255, 241, 59, 4),
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          if (imageUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(7),
+              child: Container(
+                width: double.infinity,
+                height: 150,
+                color: Colors.black,
+                child: Image.network(
+                  imageUrl,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => Container(
+                    color: Colors.black26,
+                    alignment: Alignment.center,
+                    child: const Icon(
+                      Icons.live_tv,
+                      color: Colors.white54,
+                      size: 34,
+                    ),
+                  ),
+                ),
+              ),
+            )
+          else
+            Container(
+              height: 130,
+              width: double.infinity,
+              color: Colors.black26,
+              alignment: Alignment.center,
+              child: const Icon(Icons.live_tv, color: Colors.white54, size: 34),
+            ),
+          const SizedBox(height: 9),
+          Text(
+            program.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
+            style: const TextStyle(color: Colors.grey, fontSize: 11),
+          ),
+          if (program.description.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              program.description.trim(),
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                height: 1.35,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEpgProgrammeRow(EpgProgram program, String channelLogoUrl) {
+    final imageUrl = (program.imageUrl?.trim().isNotEmpty == true)
+        ? program.imageUrl!.trim()
+        : channelLogoUrl.trim();
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: ShroudyColors.innerLogoBg,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (imageUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.network(
+                imageUrl,
+                width: 72,
+                height: 48,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Container(
+                  width: 72,
+                  height: 48,
+                  color: Colors.black26,
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.tv, color: Colors.white54, size: 22),
+                ),
+              ),
+            )
+          else
+            Container(
+              width: 72,
+              height: 48,
+              color: Colors.black26,
+              alignment: Alignment.center,
+              child: const Icon(Icons.tv, color: Colors.white54, size: 22),
+            ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  program.title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${_formatEpgTime(program.start)} – ${_formatEpgTime(program.stop)}',
+                  style: const TextStyle(color: Colors.grey, fontSize: 10),
+                ),
+                if (program.description.trim().isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    program.description.trim(),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 10,
+                      height: 1.25,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatEpgTime(DateTime value) {
+    final local = value.toLocal();
+    final h = local.hour % 12 == 0 ? 12 : local.hour % 12;
+    final m = local.minute.toString().padLeft(2, '0');
+    return '$h:$m ${local.hour >= 12 ? 'PM' : 'AM'}';
+  }
+
   Widget _buildPremiumSplitPlayerLayoutView(List<ChannelItem> channels) {
     final relatedChannels = _allChannelsList
         .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
@@ -301,15 +1314,15 @@ class _MainDashboardState extends State<MainDashboard> {
             children: [
               Expanded(
                 child: Text(
-                  'NOW PLAYING: ${_currentChannel!.name.toUpperCase()}',
-                  style: const TextStyle(color: ShroudyColors.primaryRed, fontSize: 20, fontWeight: FontWeight.bold),
+                  '📺  Shroudy TV',
+                  style: const TextStyle(color: Color.fromARGB(255, 230, 189, 101), fontSize: 20, fontWeight: FontWeight.bold),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
               const SizedBox(width: 16),
               ElevatedButton(
-                onPressed: () => setState(() => _currentChannel = null),
+                onPressed: _closePlayer,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: ShroudyColors.cardNavyBg,
                   side: const BorderSide(color: ShroudyColors.accentBorder, width: 1.5),
@@ -332,14 +1345,7 @@ class _MainDashboardState extends State<MainDashboard> {
                   flex: 2,
                   child: Container(
                     color: Colors.black,
-                    child: VideoCanvasPlayerLayer(
-                      key: ValueKey(_currentChannel!.streamUrl),
-                      streamUrl: _currentChannel!.streamUrl,
-                      channelName: _currentChannel!.name,
-                      isFavorited: _favoritesList.contains(_currentChannel!.name),
-                      onFavToggle: () => _toggleFavorite(_currentChannel!.name),
-                      onClose: () => setState(() => _currentChannel = null),
-                    ),
+                    child: _buildPlayer(isFullscreen: false),
                   ),
                 ),
                 const SizedBox(width: 24),
@@ -351,20 +1357,7 @@ class _MainDashboardState extends State<MainDashboard> {
                       color: ShroudyColors.cardNavyBg,
                       border: BorderBorder(side: BorderSide(color: ShroudyColors.accentBorder, width: 1)),
                     ),
-                    child: const SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('YOU ARE WATCHING', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 16),
-                          Text('EPG • PROGRAMME GUIDE', style: TextStyle(color: ShroudyColors.primaryRed, fontSize: 11, fontWeight: FontWeight.bold)),
-                          SizedBox(height: 6),
-                          Text('NOW • libVLC / VideoLAN decoder', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                          SizedBox(height: 12),
-                          Text('VLC-based playback supports network streams including MPEG-TS and HLS, subject to stream/server compatibility.', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                        ],
-                      ),
-                    ),
+                    child: _buildEpgPanel(_currentChannel!),
                   ),
                 ),
               ],
@@ -373,7 +1366,7 @@ class _MainDashboardState extends State<MainDashboard> {
         ),
         const Padding(
           padding: EdgeInsets.only(left: 24, top: 16, bottom: 8),
-          child: Align(alignment: Alignment.centerLeft, child: Text('★ CHANNELS FROM SAME CATEGORY', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold))),
+          child: Align(alignment: Alignment.centerLeft, child: Text('★ CHANNELS FROM SAME CATEGORY', style: TextStyle(color: Color.fromARGB(255, 248, 203, 1), fontSize: 13, fontWeight: FontWeight.bold))),
         ),
         Expanded(
           flex: 1,
@@ -381,34 +1374,46 @@ class _MainDashboardState extends State<MainDashboard> {
             padding: const EdgeInsets.only(left: 24, right: 24, bottom: 20),
             child: relatedChannels.isEmpty
                 ? const Center(child: Text('No related channels in this category', style: TextStyle(color: Colors.grey, fontSize: 12)))
-                : ListView.builder(
-                    scrollDirection: Axis.horizontal,
+                : GridView.builder(
+                    padding: const EdgeInsets.only(right: 0),
+                    gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                      maxCrossAxisExtent: 180,
+                      mainAxisSpacing: 12,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 1.15,
+                    ),
                     itemCount: relatedChannels.length,
                     itemBuilder: (context, idx) {
                       final relChannel = relatedChannels[idx];
-                      return Container(
-                        width: 140,
-                        margin: const EdgeInsets.only(right: 12),
-                        child: Card(
-                          color: ShroudyColors.cardNavyBg,
-                          shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
-                          child: InkWell(
-                            onTap: () => setState(() => _currentChannel = relChannel),
-                            child: Padding(
-                              padding: const EdgeInsets.all(8),
-                              child: Column(
-                                children: [
-                                  Expanded(
-                                    child: Container(
-                                      color: ShroudyColors.innerLogoBg,
-                                      width: double.infinity,
-                                      child: Image.network(relChannel.logoUrl, fit: BoxFit.contain, errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white)),
+                      return Card(
+                        color: ShroudyColors.cardNavyBg,
+                        margin: EdgeInsets.zero,
+                        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+                        child: InkWell(
+                          onTap: () => setState(() => _currentChannel = relChannel),
+                          child: Padding(
+                            padding: const EdgeInsets.all(8),
+                            child: Column(
+                              children: [
+                                Expanded(
+                                  child: Container(
+                                    color: ShroudyColors.innerLogoBg,
+                                    width: double.infinity,
+                                    child: Image.network(
+                                      relChannel.logoUrl,
+                                      fit: BoxFit.contain,
+                                      errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
                                     ),
                                   ),
-                                  const SizedBox(height: 4),
-                                  Text(relChannel.name, style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
-                                ],
-                              ),
+                                ),
+                                const SizedBox(height: 5),
+                                Text(
+                                  relChannel.name,
+                                  style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
                             ),
                           ),
                         ),
@@ -425,16 +1430,25 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   final String streamUrl;
   final String channelName;
   final bool isFavorited;
+  final bool isFullscreen;
+
   final VoidCallback onFavToggle;
   final VoidCallback onClose;
+  final ValueChanged<bool> onFullscreenChanged;
+  final VoidCallback onPrevious;
+  final VoidCallback onNext;
 
   const VideoCanvasPlayerLayer({
     super.key,
     required this.streamUrl,
     required this.channelName,
     required this.isFavorited,
+    required this.isFullscreen,
     required this.onFavToggle,
     required this.onClose,
+    required this.onFullscreenChanged,
+    required this.onPrevious,
+    required this.onNext,
   });
 
   @override
@@ -445,10 +1459,25 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   late VlcPlayerController _controller;
 
   bool _showControls = true;
-  bool _isFullscreen = false;
+  bool _isPlaying = false;
+  // Set when the user pauses. On live streams VLC may ignore pause(), so this
+  // is the source of truth for the button icon; _togglePlayPause force-stops the
+  // stream if VLC is still playing shortly after a pause request.
+  bool _userPaused = false;
   String? _errorText;
-  VlcVideoFit _currentFit = VlcVideoFit.contain;
 
+  // Buffering overlay state is kept separately from VLC's raw playback state.
+  // Some live IPTV streams can leave VLC reporting opening/buffering even
+  // after the video is usable, or can remain in that state indefinitely.
+  // The watchdog prevents the spinner from becoming permanent.
+  bool _showBuffering = true;
+  Timer? _bufferingTimer;
+  static const Duration _bufferingWatchdog = Duration(seconds: 12);
+
+  // VLC keeps the picture's own shape inside its view, so "Fit to screen" is
+  // achieved by making the view larger than the screen and letting the edges be
+  // cut off. That needs the size VLC is actually drawing at.
+  Size? _videoSize;
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
@@ -458,35 +1487,156 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   Timer? _controlsTimer;
 
+  // Shared gesture state so the normal and fullscreen views stay in sync.
+  // Volume controls the real iOS device volume (0..100) via
+  // `flutter_volume_controller`. Brightness is applied through the
+  // `screen_brightness` plugin using the app-scoped setter, so it does not
+  // modify the system-wide brightness setting.
+  final ValueNotifier<int> _volumeNotifier = ValueNotifier<int>(100);
+  final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
+  StreamSubscription<double>? _volumeSubscription;
+
   @override
   void initState() {
     super.initState();
     _createController(widget.streamUrl);
-    _scheduleControlsHide();
+    _showControlsTemporarily();
+    _syncInitialBrightness();
+    _syncInitialVolume();
+  }
+
+  void _syncInitialVolume() {
+    // Hide the native volume HUD so our own overlay indicator is the only one.
+    FlutterVolumeController.updateShowSystemUI(false);
+    // emitOnStart seeds the notifier with the device's current volume and then
+    // keeps it in sync if the user changes volume with the physical buttons.
+    _volumeSubscription = FlutterVolumeController.addListener(
+      (volume) {
+        if (!mounted) return;
+        _volumeNotifier.value = (volume.clamp(0.0, 1.0) * 100).round();
+      },
+      emitOnStart: true,
+    );
+  }
+
+  @override
+  void didUpdateWidget(VideoCanvasPlayerLayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Channel switches used to be handled by giving the widget a
+    // ValueKey(streamUrl), which recreated the State. Now that the parent
+    // owns a stable GlobalKey across fullscreen transitions, we have to
+    // detect the URL change ourselves and rebuild the controller in place.
+    if (oldWidget.streamUrl != widget.streamUrl) {
+      _controller.removeListener(_playerListener);
+      _controller.dispose();
+      _tracksLoaded = false;
+      _errorText = null;
+      _videoSize = null;
+      _showBuffering = true;
+      _bufferingTimer?.cancel();
+      _selectedAudioTrackId = null;
+      _selectedSubtitleTrackId = null;
+      _audioTracks = [];
+      _subtitleTracks = [];
+      _createController(widget.streamUrl);
+      _showControlsTemporarily();
+    }
+  }
+
+  Future<void> _syncInitialBrightness() async {
+    try {
+      final current = await ScreenBrightness.instance.application;
+      if (!mounted) return;
+      _brightnessNotifier.value = current.clamp(0.0, 1.0);
+    } catch (e) {
+      debugPrint('Could not read application brightness: $e');
+    }
+  }
+
+  static const List<String> _baseMediaOptions = [
+    ':network-caching=1000',
+    ':live-caching=1000',
+    ':file-caching=1000',
+    ':http-reconnect=true',
+    ':clock-jitter=0',
+    ':clock-synchro=0',
+  ];
+
+  Future<void> _applyTrackSelection() async {
+    final audioId = _selectedAudioTrackId;
+    final subtitleId = _selectedSubtitleTrackId;
+    try {
+      // A null audio id means "Default": leave VLC's own choice alone.
+      if (audioId != null) await _controller.setAudioTrack(audioId);
+      // Selecting "None" must actually disable subtitles.
+      if (subtitleId == null) {
+        await _controller.disableSubtitle();
+      } else {
+        await _controller.setSubtitleTrack(subtitleId);
+      }
+    } catch (e) {
+      debugPrint('Track selection error: $e');
+    }
   }
 
   void _createController(String url) {
     _controller = VlcPlayerController(
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
-        mediaOptions: const [
-          ':network-caching=1000',
-          ':live-caching=1000',
-          ':file-caching=1000',
-          ':http-reconnect=true',
-          ':clock-jitter=0',
-          ':clock-synchro=0',
-        ],
+        mediaOptions: _baseMediaOptions,
       ),
       autoPlay: true,
     );
     _controller.addListener(_playerListener);
+    _isPlaying = true;
+    _userPaused = false;
+    _showBuffering = true;
+    _scheduleBufferingWatchdog();
+    _playingNotifier.value = true;
+  }
+
+  void _scheduleBufferingWatchdog() {
+    _bufferingTimer?.cancel();
+    if (!_showBuffering || _userPaused || !mounted) return;
+    _bufferingTimer = Timer(_bufferingWatchdog, () {
+      if (!mounted) return;
+      // If VLC has not reached a usable playing state after the watchdog
+      // period, stop showing the endless spinner. VLC continues attempting
+      // the stream in the background, so a later playing event can restore
+      // normal state without changing the UI.
+      if (!_controller.value.isPlaying && !_userPaused) {
+        setState(() => _showBuffering = false);
+      }
+    });
+  }
+
+  void _stopBufferingIndicator() {
+    _bufferingTimer?.cancel();
+    _bufferingTimer = null;
+    if (_showBuffering && mounted) {
+      setState(() => _showBuffering = false);
+    }
   }
 
   void _playerListener() {
     if (!mounted) return;
 
     final value = _controller.value;
+    final playing = value.isPlaying;
+
+    // isPlaying is the important signal here. A number of live IPTV inputs
+    // keep VLC's state at buffering/opening even though frames are already
+    // being rendered. Never keep the spinner over a stream that VLC reports
+    // as actually playing.
+    final loadingState = value.state == VlcPlaybackState.opening ||
+        value.state == VlcPlaybackState.buffering;
+    if (playing || !loadingState || _userPaused) {
+      _stopBufferingIndicator();
+    } else if (!_showBuffering) {
+      _showBuffering = true;
+      _scheduleBufferingWatchdog();
+      setState(() {});
+    }
 
     if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
       if (_errorText != value.errorMessage) {
@@ -494,23 +1644,54 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       }
     }
 
-    // Keep the play/pause icon in sync with the native VLC player.
-    if (mounted) setState(() {});
+    // The zoom-to-fill geometry depends on what VLC is really drawing, so pick
+    // up the decoded size as soon as it is reported. VLC clears it when the
+    // stream is stopped, which is not a change in the picture's shape, so the
+    // last known size is kept.
+    final reportedSize = value.videoSize;
+    if (reportedSize != null && _videoSize != reportedSize) {
+      _videoSize = reportedSize;
+      setState(() {});
+    }
+
+    // Do not call setState on every VLC update unless something actually
+    // changed. Excess rebuilds can interfere with native player controls.
+    if (_isPlaying != playing) {
+      _isPlaying = playing;
+      _playingNotifier.value = playing;
+      setState(() {});
+    }
+
     _loadTracksOnce();
   }
 
+  bool _tracksLoaded = false;
+
   Future<void> _loadTracksOnce() async {
+    if (_tracksLoaded) return;
+
     try {
-      if (_audioTracks.isNotEmpty || !_controller.value.isPlaying) return;
+      // Native VLC can expose tracks a little after playback starts. Retry a few
+      // times instead of permanently leaving the settings dialog empty.
+      for (int attempt = 0; attempt < 5 && mounted; attempt++) {
+        try {
+          final aud = await _controller.getAudioTracks();
+          final sub = await _controller.getSubtitleTracks();
 
-      final aud = await _controller.getAudioTracks();
-      final sub = await _controller.getSubtitleTracks();
-
-      if (mounted && (aud.isNotEmpty || sub.isNotEmpty)) {
-        setState(() {
-          _audioTracks = aud;
-          _subtitleTracks = sub;
-        });
+          if (aud.isNotEmpty || sub.isNotEmpty) {
+            _tracksLoaded = true;
+            if (mounted) {
+              setState(() {
+                _audioTracks = aud;
+                _subtitleTracks = sub;
+              });
+            }
+            return;
+          }
+        } catch (e) {
+          debugPrint('Track query attempt ${attempt + 1}: $e');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 500));
       }
     } catch (e) {
       debugPrint('Media tracks are not ready yet: $e');
@@ -519,10 +1700,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   void _scheduleControlsHide() {
     _controlsTimer?.cancel();
-    if (!_showControls) return;
-
     _controlsTimer = Timer(const Duration(seconds: 4), () {
-      if (mounted && !_isFullscreen) {
+      if (mounted) {
         setState(() => _showControls = false);
       }
     });
@@ -530,90 +1709,86 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   void _showControlsTemporarily() {
     if (!mounted) return;
-    setState(() => _showControls = true);
+    // Skip the setState when controls are already visible so a drag start
+    // doesn't rebuild the whole player Stack for nothing.
+    if (!_showControls) setState(() => _showControls = true);
     _scheduleControlsHide();
   }
 
-  @override
-  void dispose() {
-    _controlsTimer?.cancel();
-    _controller.removeListener(_playerListener);
-    _controller.dispose();
-    super.dispose();
-  }
-
   Future<void> _togglePlayPause() async {
+    _showControlsTemporarily();
+    final value = _controller.value;
+    // Want to pause unless we already consider it paused (user-paused, or VLC
+    // itself reports a paused/stopped/ended/idle state).
+    final wantPause = !(_userPaused || _isPausedState(value.state));
     try {
-      if (_controller.value.isPlaying) {
+      if (wantPause) {
+        // Flip the UI immediately so the button feels responsive even before
+        // the native state event arrives.
+        setState(() {
+          _userPaused = true;
+          _showBuffering = false;
+        });
+        _bufferingTimer?.cancel();
         await _controller.pause();
+        // Live IPTV inputs frequently ignore pause() (canPause == false), so the
+        // picture keeps running. Verify shortly after: if VLC is still active,
+        // force stop(), which reliably freezes a live stream. play() re-opens it
+        // at the live edge on resume.
+        Future.delayed(const Duration(milliseconds: 600), () async {
+          if (!mounted || !_userPaused) return;
+          if (!_isPausedState(_controller.value.state)) {
+            await _controller.stop();
+          }
+        });
       } else {
+        setState(() {
+          _userPaused = false;
+          _showBuffering = true;
+        });
+        _scheduleBufferingWatchdog();
         await _controller.play();
       }
-      if (mounted) {
-        setState(() {});
-        _showControlsTemporarily();
-      }
     } catch (e) {
-      debugPrint('Play/pause error: $e');
+      debugPrint('VLC play/pause error: $e');
     }
   }
 
-  Future<void> _toggleFullscreen() async {
-    if (_isFullscreen) {
-      Navigator.of(context).pop();
-      return;
-    }
+  // True only for states where playback is NOT active, i.e. tapping should
+  // resume. opening/buffering/playing all count as "active" so we pause them.
+  static bool _isPausedState(VlcPlaybackState state) {
+    return state == VlcPlaybackState.paused ||
+        state == VlcPlaybackState.stopped ||
+        state == VlcPlaybackState.ended ||
+        state == VlcPlaybackState.idle;
+  }
 
-    // Remove this player from the normal layout before putting the SAME
-    // VLC controller into the fullscreen route. This avoids two VlcPlayer
-    // widgets trying to render the same native VLC view at once.
-    setState(() {
-      _isFullscreen = true;
-      _showControls = true;
-    });
+  void _toggleFullscreen() {
+    _showControlsTemporarily();
+    // Fullscreen ownership lives in _MainDashboardState so the VlcPlayer
+    // widget is never unmounted across the transition (which would tear
+    // down the platform view and force VLC to re-buffer the live stream).
+    widget.onFullscreenChanged(!widget.isFullscreen);
+  }
 
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  late final ValueNotifier<bool> _playingNotifier = ValueNotifier<bool>(false);
 
+  void _syncPlayingNotifier() {
+    _playingNotifier.value = _isPlaying;
+  }
+
+  Future<void> _openPlayerSettingsDialog() async {
+    await _loadTracksOnce();
     if (!mounted) return;
 
-    await Navigator.of(context).push(
-      PageRouteBuilder(
-        opaque: true,
-        barrierColor: Colors.black,
-        transitionDuration: const Duration(milliseconds: 150),
-        reverseTransitionDuration: const Duration(milliseconds: 150),
-        pageBuilder: (_, __, ___) => _FullscreenVlcView(
-          controller: _controller,
-          channelName: widget.channelName,
-          currentFit: _currentFit,
-          isFavorited: widget.isFavorited,
-          onFavToggle: widget.onFavToggle,
-          onSettings: _openPlayerSettingsDialog,
-          onPlayPause: _togglePlayPause,
-          onExit: () => Navigator.of(context).pop(),
-        ),
-      ),
-    );
-
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-
-    if (mounted) {
-      setState(() {
-        _isFullscreen = false;
-        _showControls = true;
-      });
-      _scheduleControlsHide();
-    }
-  }
-
-  void _openPlayerSettingsDialog() {
     String tempAspect = _selectedAspectRatio;
     int? tempAudio = _selectedAudioTrackId;
     int? tempSubtitle = _selectedSubtitleTrackId;
 
     showDialog(
       context: context,
-      builder: (context) {
+      barrierDismissible: true,
+      builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
@@ -623,8 +1798,10 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                 children: [
                   Icon(Icons.settings, color: Colors.blueAccent),
                   SizedBox(width: 8),
-                  Text('Player Settings',
-                      style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  Text(
+                    'Player Settings',
+                    style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
                 ],
               ),
               content: Column(
@@ -634,7 +1811,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                   _buildDropdownRow(
                     label: 'Aspect Ratio:',
                     value: tempAspect,
-                    items: ['Fit to screen', '16:9', '4:3'],
+                    items: const ['Fit to screen', '16:9', '4:3'],
                     onChanged: (val) => setDialogState(() => tempAspect = val!),
                   ),
                   const SizedBox(height: 12),
@@ -646,10 +1823,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         value: -1,
                         child: Text('Default', style: TextStyle(color: Colors.white)),
                       ),
-                      ..._audioTracks.map((t) => DropdownMenuItem(
-                            value: t.id,
-                            child: Text(t.name, style: const TextStyle(color: Colors.white)),
-                          )),
+                      ..._audioTracks.map(
+                        (t) => DropdownMenuItem(
+                          value: t.id,
+                          child: Text(t.name, style: const TextStyle(color: Colors.white)),
+                        ),
+                      ),
                     ],
                     onChanged: (val) =>
                         setDialogState(() => tempAudio = val == -1 ? null : val as int?),
@@ -664,10 +1843,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                         value: -1,
                         child: Text('None', style: TextStyle(color: Colors.white)),
                       ),
-                      ..._subtitleTracks.map((t) => DropdownMenuItem(
-                            value: t.id,
-                            child: Text(t.name, style: const TextStyle(color: Colors.white)),
-                          )),
+                      ..._subtitleTracks.map(
+                        (t) => DropdownMenuItem(
+                          value: t.id,
+                          child: Text(t.name, style: const TextStyle(color: Colors.white)),
+                        ),
+                      ),
                     ],
                     onChanged: (val) =>
                         setDialogState(() => tempSubtitle = val == -1 ? null : val as int?),
@@ -684,12 +1865,16 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       padding: const EdgeInsets.symmetric(vertical: 12),
                     ),
-                    onPressed: () {
-                      _applySettings(tempAspect, tempAudio, tempSubtitle);
-                      Navigator.pop(context);
+                    onPressed: () async {
+                      await _applySettings(tempAspect, tempAudio, tempSubtitle);
+                      if (dialogContext.mounted) {
+                        Navigator.of(dialogContext).pop();
+                      }
                     },
-                    child: const Text('Apply Save',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    child: const Text(
+                      'Apply & Save',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                    ),
                   ),
                 ),
               ],
@@ -721,18 +1906,25 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
           width: 140,
           child: DropdownButtonHideUnderline(
             child: DropdownButton<dynamic>(
+              isExpanded: true,
               value: value,
               dropdownColor: const Color(0xFF040F1E),
               icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
               onChanged: onChanged,
               items: isCustomItems
                   ? items.cast<DropdownMenuItem<dynamic>>()
-                  : items.map((item) {
-                      return DropdownMenuItem<dynamic>(
-                        value: item,
-                        child: Text(item.toString(), style: const TextStyle(color: Colors.white)),
-                      );
-                    }).toList(),
+                  : items
+                      .map(
+                        (item) => DropdownMenuItem<dynamic>(
+                          value: item,
+                          child: Text(
+                            item.toString(),
+                            style: const TextStyle(color: Colors.white),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      )
+                      .toList(),
             ),
           ),
         ),
@@ -740,54 +1932,173 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-  void _applySettings(String aspect, int? audioId, int? subtitleId) {
-    setState(() {
-      _selectedAspectRatio = aspect;
-      _selectedAudioTrackId = audioId;
-      _selectedSubtitleTrackId = subtitleId;
-
-      if (aspect == '16:9') {
-        _currentFit = VlcVideoFit.fill;
-      } else if (aspect == '4:3') {
-        _currentFit = VlcVideoFit.cover;
-      } else {
-        _currentFit = VlcVideoFit.contain;
-      }
-    });
-
-    if (audioId != null) {
-      _controller.setAudioTrack(audioId);
+  Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
+    if (mounted) {
+      setState(() {
+        _selectedAspectRatio = aspect;
+        _selectedAudioTrackId = audioId;
+        _selectedSubtitleTrackId = subtitleId;
+      });
     }
-    if (subtitleId != null) {
-      _controller.setSubtitleTrack(subtitleId);
-    }
-
+    await _applyTrackSelection();
     _showControlsTemporarily();
+  }
+
+  // True once shutdown() has torn down the native audio/VLC resources. dispose()
+  // checks this so it does not repeat (and race) the same native calls.
+  bool _shutDown = false;
+
+  // Orderly teardown, awaited BEFORE the widget is unmounted. VLC and
+  // flutter_volume_controller share the single iOS AVAudioSession; the volume
+  // plugin's onCancel calls setActive(false), which deadlocks the main thread
+  // if VLC's audio unit is still running. So we stop VLC first (releasing the
+  // session), await it, and only then cancel the volume listener.
+  Future<void> shutdown() async {
+    if (_shutDown) return;
+    _shutDown = true;
+    _controlsTimer?.cancel();
+    _controlsTimer = null;
+    _bufferingTimer?.cancel();
+    _bufferingTimer = null;
+    try {
+      await _controller.stop();
+    } catch (e) {
+      debugPrint('shutdown stop: $e');
+    }
+    await _volumeSubscription?.cancel();
+    _volumeSubscription = null;
+    FlutterVolumeController.removeListener();
+    try {
+      await FlutterVolumeController.updateShowSystemUI(true);
+    } catch (e) {
+      debugPrint('shutdown updateShowSystemUI: $e');
+    }
+    try {
+      await ScreenBrightness.instance.resetApplicationScreenBrightness();
+    } catch (e) {
+      debugPrint('shutdown resetBrightness: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _controlsTimer?.cancel();
+    _bufferingTimer?.cancel();
+    if (!_shutDown) {
+      // Fallback for the rare path where the widget is removed without an
+      // awaited shutdown(). Stop VLC before touching the shared audio session
+      // so the volume plugin's setActive(false) never races a live audio unit.
+      unawaited(_controller.stop().catchError(
+        (Object e) => debugPrint('dispose stop: $e'),
+      ));
+      _volumeSubscription?.cancel();
+      FlutterVolumeController.removeListener();
+      FlutterVolumeController.updateShowSystemUI(true);
+      ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
+        (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
+      );
+    }
+    _playingNotifier.dispose();
+    _volumeNotifier.dispose();
+    _brightnessNotifier.dispose();
+    _controller.removeListener(_playerListener);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  // The rectangle handed to the native view for the current mode. VLC always
+  // keeps the picture's own shape inside that rectangle, so filling an area
+  // means giving it a rectangle at least as big on both axes and letting the
+  // overflow be clipped.
+  Size _videoRect(Size box) {
+    final boxRatio = box.width / box.height;
+    switch (_selectedAspectRatio) {
+      case '16:9':
+      case '4:3':
+        // Largest rectangle of the chosen shape that fits inside the area.
+        final ratio = _selectedAspectRatio == '4:3' ? 4 / 3 : 16 / 9;
+        return ratio > boxRatio
+            ? Size(box.width, box.width / ratio)
+            : Size(box.height * ratio, box.height);
+      default:
+        final source = _videoSize;
+        if (source == null || source.width <= 0 || source.height <= 0) return box;
+        final ratio = source.width / source.height;
+        // Smallest rectangle of the picture's shape that still covers the area,
+        // plus a little overscan: VLC reports the coded size, which can differ a
+        // few percent from the shape it displays, and any shortfall shows up as
+        // a black line while the extra crop is invisible.
+        final covered = ratio > boxRatio
+            ? Size(box.height * ratio, box.height)
+            : Size(box.width, box.width / ratio);
+        return Size(covered.width * 1.02, covered.height * 1.02);
+    }
+  }
+
+  Widget _buildVideoWidget() {
+    // `fit` is deliberately constant: vlc_player keys its native view on it, so
+    // changing it tears the view down and VLC re-opens the live stream. It is
+    // also ignored on iOS, which is why the rectangle below is what actually
+    // controls the shape on screen.
+    final player = VlcPlayer(
+      controller: _controller,
+      backgroundColor: Colors.black,
+      fit: VlcVideoFit.contain,
+    );
+
+    // The widget tree around the player never changes shape: switching mode
+    // only resizes the rectangle it is given, so the live stream keeps playing
+    // instead of being torn down and reopened.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final box = constraints.biggest;
+        final rect = box.width > 0 && box.height > 0 ? _videoRect(box) : box;
+        return ClipRect(
+          child: OverflowBox(
+            alignment: Alignment.center,
+            maxWidth: double.infinity,
+            maxHeight: double.infinity,
+            child: SizedBox(
+              width: rect.width,
+              height: rect.height,
+              child: player,
+            ),
+          ),
+        );
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // While the fullscreen route owns the native VLC view, leave this
-    // widget empty so the controller is never rendered twice.
-    if (_isFullscreen) {
-      return const ColoredBox(color: Colors.black);
-    }
+    _syncPlayingNotifier();
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _showControlsTemporarily,
-      onDoubleTap: _toggleFullscreen,
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          VlcPlayer(
-            controller: _controller,
-            backgroundColor: Colors.black,
-            fit: _currentFit,
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // VLC video.
+        _buildVideoWidget(),
+
+        // Left/right vertical drag: brightness / volume.
+        _VideoGestureLayer(
+          volumeNotifier: _volumeNotifier,
+          brightnessNotifier: _brightnessNotifier,
+          onActivity: _showControlsTemporarily,
+        ),
+
+        // Transparent touch layer ABOVE the video. This is deliberate:
+        // touching anywhere on the video immediately reveals controls.
+        Positioned.fill(
+          child: Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: (_) => _showControlsTemporarily(),
+            child: const SizedBox.expand(),
           ),
+        ),
 
-          if (_errorText != null)
-            Positioned.fill(
+        if (_errorText != null)
+          Positioned.fill(
+            child: IgnorePointer(
               child: Container(
                 color: Colors.black54,
                 alignment: Alignment.center,
@@ -799,82 +2110,121 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                 ),
               ),
             ),
+          ),
 
-          if (_showControls)
-            Positioned.fill(
-              child: IgnorePointer(
-                ignoring: false,
-                child: Column(
-                  children: [
-                    // Transparent top area. The channel title is shown without
-                    // a black panel behind it.
-                    SafeArea(
-                      bottom: false,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                        child: Text(
-                          widget.channelName,
-                          textAlign: TextAlign.center,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(blurRadius: 5, color: Colors.black),
-                              Shadow(blurRadius: 10, color: Colors.black),
-                            ],
+        if (_showControls)
+          Positioned.fill(
+            child: Column(
+              children: [
+                SafeArea(
+                  bottom: false,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: IgnorePointer(
+                            child: Text(
+                              widget.channelName,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                shadows: [
+                                  Shadow(blurRadius: 5, color: Colors.black),
+                                  Shadow(blurRadius: 10, color: Colors.black),
+                                ],
+                              ),
+                            ),
                           ),
                         ),
-                      ),
+                        // Top-right back button: exits fullscreen. Only shown
+                        // in fullscreen, where there is no other chrome to
+                        // leave with (the split view has its own Back button).
+                        if (widget.isFullscreen)
+                          _playerIconButton(
+                            icon: Icons.arrow_back,
+                            tooltip: 'Exit Fullscreen',
+                            onPressed: () => widget.onFullscreenChanged(false),
+                          ),
+                      ],
                     ),
-                    const Spacer(),
-
-                    // NO BLACK CONTROL PANEL: only the buttons are visible.
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 16),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          _playerIconButton(
-                            icon: _controller.value.isPlaying ? Icons.pause : Icons.play_arrow,
-                            tooltip: _controller.value.isPlaying ? 'Pause' : 'Play',
-                            onPressed: _togglePlayPause,
-                          ),
-                          _playerIconButton(
-                            icon: Icons.settings,
-                            tooltip: 'Player Settings',
-                            onPressed: _openPlayerSettingsDialog,
-                          ),
-                          _playerIconButton(
-                            icon: widget.isFavorited ? Icons.star : Icons.star_border,
-                            tooltip: 'Favorite',
-                            iconColor:
-                                widget.isFavorited ? ShroudyColors.goldText : Colors.white,
-                            onPressed: widget.onFavToggle,
-                          ),
-                          _playerIconButton(
-                            icon: _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                            tooltip: 'Fullscreen',
-                            onPressed: _toggleFullscreen,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
-              ),
+                const Spacer(),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Row(
+                    children: [
+                      // LEFT: previous / play-pause / next
+                      _playerIconButton(
+                        icon: Icons.skip_previous,
+                        tooltip: 'Previous Channel',
+                        onPressed: widget.onPrevious,
+                      ),
+                      // Icon reflects the user's pause intent first (so it flips
+                      // instantly), falling back to VLC's reported state.
+                      ValueListenableBuilder<VlcPlayerValue>(
+                        valueListenable: _controller,
+                        builder: (context, value, _) {
+                          final paused = _userPaused || _isPausedState(value.state);
+                          return _playerIconButton(
+                            icon: paused ? Icons.play_arrow : Icons.pause,
+                            tooltip: paused ? 'Play' : 'Pause',
+                            onPressed: _togglePlayPause,
+                          );
+                        },
+                      ),
+                      _playerIconButton(
+                        icon: Icons.skip_next,
+                        tooltip: 'Next Channel',
+                        onPressed: widget.onNext,
+                      ),
+
+                      const Spacer(),
+
+                      // MIDDLE: favorite
+                      _playerIconButton(
+                        icon: widget.isFavorited ? Icons.star : Icons.star_border,
+                        tooltip: 'Favorite',
+                        iconColor: widget.isFavorited ? ShroudyColors.goldText : Colors.white,
+                        onPressed: widget.onFavToggle,
+                      ),
+
+                      const Spacer(),
+
+                      // RIGHT: settings / fullscreen
+                      _playerIconButton(
+                        icon: Icons.settings,
+                        tooltip: 'Player Settings',
+                        onPressed: _openPlayerSettingsDialog,
+                      ),
+                      _playerIconButton(
+                        icon: widget.isFullscreen
+                            ? Icons.fullscreen_exit
+                            : Icons.fullscreen,
+                        tooltip: widget.isFullscreen
+                            ? 'Exit Fullscreen'
+                            : 'Fullscreen',
+                        onPressed: _toggleFullscreen,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
-        ],
-      ),
+          ),
+      ],
     );
   }
 
   Widget _playerIconButton({
     required IconData icon,
     required String tooltip,
-    required VoidCallback onPressed,
+    required FutureOr<void> Function() onPressed,
     Color iconColor = Colors.white,
   }) {
     return Padding(
@@ -883,9 +2233,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         type: MaterialType.transparency,
         child: InkWell(
           customBorder: const CircleBorder(),
-          onTap: () {
+          onTap: () async {
             _showControlsTemporarily();
-            onPressed();
+            await onPressed();
           },
           child: Tooltip(
             message: tooltip,
@@ -905,55 +2255,154 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 }
 
-/// Fullscreen owner of the existing VLC controller.
-/// It automatically hides controls after a few seconds and shows them
-/// whenever the video area is touched.
-class _FullscreenVlcView extends StatefulWidget {
-  final VlcPlayerController controller;
-  final String channelName;
-  final VlcVideoFit currentFit;
-  final bool isFavorited;
-  final VoidCallback onFavToggle;
-  final VoidCallback onSettings;
-  final VoidCallback onPlayPause;
-  final VoidCallback onExit;
+extension on VlcPlayerValue {
+  String? get errorMessage => null;
+}
 
-  const _FullscreenVlcView({
-    required this.controller,
-    required this.channelName,
-    required this.currentFit,
-    required this.isFavorited,
-    required this.onFavToggle,
-    required this.onSettings,
-    required this.onPlayPause,
-    required this.onExit,
+enum _GestureSide { volume, brightness }
+
+/// Transparent overlay that turns vertical drags on the left half of the
+/// video into brightness changes (via the `screen_brightness` plugin, which
+/// is app-scoped so it does not touch the system-wide setting) and vertical
+/// drags on the right half into device volume changes.
+class _VideoGestureLayer extends StatefulWidget {
+  final ValueNotifier<int> volumeNotifier;
+  final ValueNotifier<double> brightnessNotifier;
+  // Called on gesture activity so the parent can reveal its own controls and
+  // keep both the indicators and the player chrome on the same hide schedule.
+  final VoidCallback onActivity;
+
+  const _VideoGestureLayer({
+    required this.volumeNotifier,
+    required this.brightnessNotifier,
+    required this.onActivity,
   });
 
   @override
-  State<_FullscreenVlcView> createState() => _FullscreenVlcViewState();
+  State<_VideoGestureLayer> createState() => _VideoGestureLayerState();
 }
 
-class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
-  bool _showControls = true;
+class _VideoGestureLayerState extends State<_VideoGestureLayer> {
+  static const double _minBrightness = 0.02;
+  static const double _dragRangePx = 220.0;
+
+  _GestureSide? _activeSide;
+  double _startY = 0;
+  double _startValue = 0;
+  bool _showIndicator = false;
   Timer? _hideTimer;
 
-  @override
-  void initState() {
-    super.initState();
-    _scheduleHide();
-  }
+  // In-flight guards: at most one native call per stream is pending, and
+  // the latest requested value is replayed once the current call resolves.
+  // Prevents 60+ queued platform-channel calls during a fast drag while
+  // still guaranteeing the final finger position is applied.
+  bool _volumeCallInFlight = false;
+  int? _pendingVolume;
+  bool _brightnessCallInFlight = false;
+  double? _pendingBrightness;
 
-  void _scheduleHide() {
+  void _onStart(DragStartDetails d, _GestureSide side) {
     _hideTimer?.cancel();
-    _hideTimer = Timer(const Duration(seconds: 4), () {
-      if (mounted) setState(() => _showControls = false);
-    });
+    widget.onActivity();
+    final sideChanged = _activeSide != side;
+    _activeSide = side;
+    _startY = d.globalPosition.dy;
+    _startValue = side == _GestureSide.volume
+        ? widget.volumeNotifier.value / 100.0
+        : widget.brightnessNotifier.value;
+    // Always rebuild when the side changes so the indicator flips to the
+    // correct edge even if the previous drag's hide timer hadn't fired yet.
+    if (sideChanged || !_showIndicator) {
+      setState(() => _showIndicator = true);
+    }
   }
 
-  void _touchVideo() {
-    if (!mounted) return;
-    setState(() => _showControls = true);
-    _scheduleHide();
+  void _onUpdate(DragUpdateDetails d, _GestureSide side) {
+    if (_activeSide != side) return;
+    // Dragging up increases the value; dragging down decreases it.
+    final delta = (_startY - d.globalPosition.dy) / _dragRangePx;
+
+    // Notifier is updated on EVERY value change so the on-screen indicator
+    // tracks the finger 1:1. Only the native call is throttled (via the
+    // in-flight guard below) — decoupling the two is what keeps the visual
+    // smooth even when the platform channel is slow.
+    if (side == _GestureSide.volume) {
+      final next = ((_startValue + delta) * 100).round().clamp(0, 100);
+      if (next != widget.volumeNotifier.value) {
+        widget.volumeNotifier.value = next;
+        _requestVolume(next);
+      }
+    } else {
+      final next = (_startValue + delta).clamp(_minBrightness, 1.0);
+      if (next != widget.brightnessNotifier.value) {
+        widget.brightnessNotifier.value = next;
+        _requestBrightness(next);
+      }
+    }
+
+    _hideTimer?.cancel();
+    widget.onActivity();
+    if (!_showIndicator) setState(() => _showIndicator = true);
+  }
+
+  void _requestVolume(int v) {
+    if (_volumeCallInFlight) {
+      _pendingVolume = v;
+      return;
+    }
+    _volumeCallInFlight = true;
+    // Drive the real iOS device volume (0.0..1.0) instead of VLC's internal
+    // volume, so the gesture matches the hardware buttons and the system mixer.
+    FlutterVolumeController.setVolume((v / 100).clamp(0.0, 1.0)).then(
+      (_) {
+        _volumeCallInFlight = false;
+        final pending = _pendingVolume;
+        _pendingVolume = null;
+        if (pending != null && pending != v && mounted) _requestVolume(pending);
+      },
+      onError: (Object e) {
+        debugPrint('Device setVolume error: $e');
+        _volumeCallInFlight = false;
+        _pendingVolume = null;
+      },
+    );
+  }
+
+  void _requestBrightness(double b) {
+    if (_brightnessCallInFlight) {
+      _pendingBrightness = b;
+      return;
+    }
+    _brightnessCallInFlight = true;
+    ScreenBrightness.instance.setApplicationScreenBrightness(b).then(
+      (_) {
+        _brightnessCallInFlight = false;
+        final pending = _pendingBrightness;
+        _pendingBrightness = null;
+        if (pending != null && pending != b && mounted) {
+          _requestBrightness(pending);
+        }
+      },
+      onError: (Object e) {
+        debugPrint('setApplicationScreenBrightness error: $e');
+        _brightnessCallInFlight = false;
+        _pendingBrightness = null;
+      },
+    );
+  }
+
+  void _onEnd(DragEndDetails d, _GestureSide side) {
+    _hideTimer?.cancel();
+    // Match the player chrome's 4s auto-hide so the brightness/volume
+    // indicator disappears together with the other controls instead of
+    // vanishing on its own shorter timer.
+    _hideTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      setState(() {
+        _activeSide = null;
+        _showIndicator = false;
+      });
+    });
   }
 
   @override
@@ -964,131 +2413,133 @@ class _FullscreenVlcViewState extends State<_FullscreenVlcView> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: _touchVideo,
-        onDoubleTap: _touchVideo,
-        child: Stack(
-          fit: StackFit.expand,
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Row(
           children: [
-            VlcPlayer(
-              controller: widget.controller,
-              backgroundColor: Colors.black,
-              fit: widget.currentFit,
-            ),
-
-            if (_showControls)
-              Positioned.fill(
-                child: Column(
-                  children: [
-                    SafeArea(
-                      bottom: false,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                        child: Text(
-                          widget.channelName,
-                          textAlign: TextAlign.center,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 17,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(blurRadius: 5, color: Colors.black),
-                              Shadow(blurRadius: 10, color: Colors.black),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                    const Spacer(),
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 18),
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          _fullIconButton(
-                            icon: widget.controller.value.isPlaying
-                                ? Icons.pause
-                                : Icons.play_arrow,
-                            tooltip:
-                                widget.controller.value.isPlaying ? 'Pause' : 'Play',
-                            onPressed: () {
-                              _touchVideo();
-                              widget.onPlayPause();
-                            },
-                          ),
-                          _fullIconButton(
-                            icon: Icons.settings,
-                            tooltip: 'Player Settings',
-                            onPressed: () {
-                              _touchVideo();
-                              widget.onSettings();
-                            },
-                          ),
-                          _fullIconButton(
-                            icon: widget.isFavorited ? Icons.star : Icons.star_border,
-                            tooltip: 'Favorite',
-                            iconColor:
-                                widget.isFavorited ? ShroudyColors.goldText : Colors.white,
-                            onPressed: () {
-                              _touchVideo();
-                              widget.onFavToggle();
-                            },
-                          ),
-                          _fullIconButton(
-                            icon: Icons.fullscreen_exit,
-                            tooltip: 'Exit Fullscreen',
-                            onPressed: widget.onExit,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onVerticalDragStart: (d) => _onStart(d, _GestureSide.brightness),
+                onVerticalDragUpdate: (d) => _onUpdate(d, _GestureSide.brightness),
+                onVerticalDragEnd: (d) => _onEnd(d, _GestureSide.brightness),
+                onVerticalDragCancel: () {
+                  if (_activeSide == _GestureSide.brightness) {
+                    _onEnd(DragEndDetails(), _GestureSide.brightness);
+                  }
+                },
               ),
+            ),
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onVerticalDragStart: (d) => _onStart(d, _GestureSide.volume),
+                onVerticalDragUpdate: (d) => _onUpdate(d, _GestureSide.volume),
+                onVerticalDragEnd: (d) => _onEnd(d, _GestureSide.volume),
+                onVerticalDragCancel: () {
+                  if (_activeSide == _GestureSide.volume) {
+                    _onEnd(DragEndDetails(), _GestureSide.volume);
+                  }
+                },
+              ),
+            ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _fullIconButton({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onPressed,
-    Color iconColor = Colors.white,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 5),
-      child: Material(
-        type: MaterialType.transparency,
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: onPressed,
-          child: Tooltip(
-            message: tooltip,
-            child: Container(
-              width: 52,
-              height: 52,
-              decoration: BoxDecoration(
-                color: Colors.black.withAlpha(125),
-                shape: BoxShape.circle,
+        if (_showIndicator && _activeSide != null)
+          IgnorePointer(
+            child: Align(
+              alignment: _activeSide == _GestureSide.volume
+                  ? Alignment.centerRight
+                  : Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 28),
+                // ValueListenableBuilder keeps the indicator reactive during
+                // the drag without rebuilding the whole gesture layer.
+                child: _activeSide == _GestureSide.volume
+                    ? ValueListenableBuilder<int>(
+                        valueListenable: widget.volumeNotifier,
+                        builder: (_, v, __) => _indicatorBody(
+                          icon: v == 0
+                              ? Icons.volume_off
+                              : (v < 50 ? Icons.volume_down : Icons.volume_up),
+                          fraction: (v / 100.0).clamp(0.0, 1.0),
+                          label: '$v%',
+                        ),
+                      )
+                    : ValueListenableBuilder<double>(
+                        valueListenable: widget.brightnessNotifier,
+                        builder: (_, b, __) => _indicatorBody(
+                          icon: Icons.brightness_6,
+                          fraction: ((b - _minBrightness) /
+                                  (1.0 - _minBrightness))
+                              .clamp(0.0, 1.0),
+                          label: '${(b * 100).round()}%',
+                        ),
+                      ),
               ),
-              child: Icon(icon, color: iconColor, size: 27),
             ),
           ),
-        ),
+      ],
+    );
+  }
+
+  Widget _indicatorBody({
+    required IconData icon,
+    required double fraction,
+    required String label,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.black.withAlpha(170),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white, size: 26),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 100,
+            width: 6,
+            child: Stack(
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                ),
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: FractionallySizedBox(
+                    heightFactor: fraction,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: 12,
+            ),
+          ),
+        ],
       ),
     );
   }
-}
-
-extension on VlcPlayerValue {
-  String? get errorMessage => null;
 }
 
 class BorderBorder extends Border {
