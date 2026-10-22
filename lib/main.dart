@@ -1474,10 +1474,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   Timer? _bufferingTimer;
   static const Duration _bufferingWatchdog = Duration(seconds: 12);
 
-  // VLC keeps the picture's own shape inside its view, so "Fit to screen" is
-  // achieved by making the view larger than the screen and letting the edges be
-  // cut off. That needs the size VLC is actually drawing at.
-  Size? _videoSize;
+  VlcVideoFit _currentFit = VlcVideoFit.fill;
   String _selectedAspectRatio = 'Fit to screen';
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
@@ -1486,6 +1483,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   List<VlcTrackDescription> _subtitleTracks = [];
 
   Timer? _controlsTimer;
+
+  // This notifier lets the fullscreen route immediately receive aspect-ratio
+  // changes made in the settings dialog.
+  late final ValueNotifier<VlcVideoFit> _fitNotifier;
+  late final ValueNotifier<String> _aspectNotifier;
 
   // Shared gesture state so the normal and fullscreen views stay in sync.
   // Volume controls the real iOS device volume (0..100) via
@@ -1499,6 +1501,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void initState() {
     super.initState();
+    _fitNotifier = ValueNotifier<VlcVideoFit>(_currentFit);
+    _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
     _createController(widget.streamUrl);
     _showControlsTemporarily();
     _syncInitialBrightness();
@@ -1531,7 +1535,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       _controller.dispose();
       _tracksLoaded = false;
       _errorText = null;
-      _videoSize = null;
       _showBuffering = true;
       _bufferingTimer?.cancel();
       _selectedAudioTrackId = null;
@@ -1553,37 +1556,18 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     }
   }
 
-  static const List<String> _baseMediaOptions = [
-    ':network-caching=1000',
-    ':live-caching=1000',
-    ':file-caching=1000',
-    ':http-reconnect=true',
-    ':clock-jitter=0',
-    ':clock-synchro=0',
-  ];
-
-  Future<void> _applyTrackSelection() async {
-    final audioId = _selectedAudioTrackId;
-    final subtitleId = _selectedSubtitleTrackId;
-    try {
-      // A null audio id means "Default": leave VLC's own choice alone.
-      if (audioId != null) await _controller.setAudioTrack(audioId);
-      // Selecting "None" must actually disable subtitles.
-      if (subtitleId == null) {
-        await _controller.disableSubtitle();
-      } else {
-        await _controller.setSubtitleTrack(subtitleId);
-      }
-    } catch (e) {
-      debugPrint('Track selection error: $e');
-    }
-  }
-
   void _createController(String url) {
     _controller = VlcPlayerController(
       mediaSource: VlcMediaSource(
         uri: Uri.parse(url),
-        mediaOptions: _baseMediaOptions,
+        mediaOptions: const [
+          ':network-caching=1000',
+          ':live-caching=1000',
+          ':file-caching=1000',
+          ':http-reconnect=true',
+          ':clock-jitter=0',
+          ':clock-synchro=0',
+        ],
       ),
       autoPlay: true,
     );
@@ -1642,16 +1626,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       if (_errorText != value.errorMessage) {
         setState(() => _errorText = value.errorMessage);
       }
-    }
-
-    // The zoom-to-fill geometry depends on what VLC is really drawing, so pick
-    // up the decoded size as soon as it is reported. VLC clears it when the
-    // stream is stopped, which is not a change in the picture's shape, so the
-    // last known size is kept.
-    final reportedSize = value.videoSize;
-    if (reportedSize != null && _videoSize != reportedSize) {
-      _videoSize = reportedSize;
-      setState(() {});
     }
 
     // Do not call setState on every VLC update unless something actually
@@ -1933,14 +1907,43 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
+    VlcVideoFit newFit;
+
+    // "Fit to screen" intentionally stretches the stream to the complete
+    // available player rectangle in both normal and fullscreen modes.
+    // 16:9 and 4:3 use `cover` so the stream fills the selected rectangle
+    // and any overflow is cropped, rather than letterboxing inside it.
+    newFit = aspect == 'Fit to screen'
+        ? VlcVideoFit.fill
+        : VlcVideoFit.cover;
+
     if (mounted) {
       setState(() {
         _selectedAspectRatio = aspect;
         _selectedAudioTrackId = audioId;
         _selectedSubtitleTrackId = subtitleId;
+        _currentFit = newFit;
       });
     }
-    await _applyTrackSelection();
+    _fitNotifier.value = newFit;
+    _aspectNotifier.value = aspect;
+
+    try {
+      // Apply the selected audio track. null means leave the current track alone.
+      if (audioId != null) {
+        await _controller.setAudioTrack(audioId);
+      }
+
+      // Selecting "None" must actually disable subtitles.
+      if (subtitleId == null) {
+        await _controller.disableSubtitle();
+      } else {
+        await _controller.setSubtitleTrack(subtitleId);
+      }
+    } catch (e) {
+      debugPrint('Track selection error: $e');
+    }
+
     _showControlsTemporarily();
   }
 
@@ -1998,6 +2001,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
       );
     }
+    _fitNotifier.dispose();
+    _aspectNotifier.dispose();
     _playingNotifier.dispose();
     _volumeNotifier.dispose();
     _brightnessNotifier.dispose();
@@ -2006,67 +2011,31 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     super.dispose();
   }
 
-  // The rectangle handed to the native view for the current mode. VLC always
-  // keeps the picture's own shape inside that rectangle, so filling an area
-  // means giving it a rectangle at least as big on both axes and letting the
-  // overflow be clipped.
-  Size _videoRect(Size box) {
-    final boxRatio = box.width / box.height;
-    switch (_selectedAspectRatio) {
-      case '16:9':
-      case '4:3':
-        // Largest rectangle of the chosen shape that fits inside the area.
-        final ratio = _selectedAspectRatio == '4:3' ? 4 / 3 : 16 / 9;
-        return ratio > boxRatio
-            ? Size(box.width, box.width / ratio)
-            : Size(box.height * ratio, box.height);
-      default:
-        final source = _videoSize;
-        if (source == null || source.width <= 0 || source.height <= 0) return box;
-        final ratio = source.width / source.height;
-        // Smallest rectangle of the picture's shape that still covers the area,
-        // plus a little overscan: VLC reports the coded size, which can differ a
-        // few percent from the shape it displays, and any shortfall shows up as
-        // a black line while the extra crop is invisible.
-        final covered = ratio > boxRatio
-            ? Size(box.height * ratio, box.height)
-            : Size(box.width, box.width / ratio);
-        return Size(covered.width * 1.02, covered.height * 1.02);
-    }
-  }
-
-  Widget _buildVideoWidget() {
-    // `fit` is deliberately constant: vlc_player keys its native view on it, so
-    // changing it tears the view down and VLC re-opens the live stream. It is
-    // also ignored on iOS, which is why the rectangle below is what actually
-    // controls the shape on screen.
+  Widget _buildVideoWidget(VlcVideoFit fit) {
     final player = VlcPlayer(
       controller: _controller,
       backgroundColor: Colors.black,
-      fit: VlcVideoFit.contain,
+      fit: fit,
     );
 
-    // The widget tree around the player never changes shape: switching mode
-    // only resizes the rectangle it is given, so the live stream keeps playing
-    // instead of being torn down and reopened.
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final box = constraints.biggest;
-        final rect = box.width > 0 && box.height > 0 ? _videoRect(box) : box;
-        return ClipRect(
-          child: OverflowBox(
-            alignment: Alignment.center,
-            maxWidth: double.infinity,
-            maxHeight: double.infinity,
-            child: SizedBox(
-              width: rect.width,
-              height: rect.height,
-              child: player,
-            ),
+    switch (_selectedAspectRatio) {
+      case '16:9':
+        return Center(
+          child: AspectRatio(
+            aspectRatio: 16 / 9,
+            child: ClipRect(child: player),
           ),
         );
-      },
-    );
+      case '4:3':
+        return Center(
+          child: AspectRatio(
+            aspectRatio: 4 / 3,
+            child: ClipRect(child: player),
+          ),
+        );
+      default:
+        return Positioned.fill(child: player);
+    }
   }
 
   @override
@@ -2076,8 +2045,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // VLC video.
-        _buildVideoWidget(),
+        // VLC video. The selected aspect ratio changes the actual widget
+        // bounds instead of merely cropping the source.
+        _buildVideoWidget(_currentFit),
 
         // Left/right vertical drag: brightness / volume.
         _VideoGestureLayer(
