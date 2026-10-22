@@ -2083,15 +2083,18 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
           ),
 
         if (_showControls)
-          Positioned.fill(
-            child: Column(
+  Positioned.fill(
+    child: Column(
+      children: [
+        // Wrap only the internal row padding to respect the status bar, 
+        // preventing the video position from shrinking
+        SafeArea(
+          bottom: false,
+          top: true,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
+            child: Row(
               children: [
-                SafeArea(
-                  bottom: false,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
-                    child: Row(
-                      children: [
                         Expanded(
                           child: IgnorePointer(
                             child: Text(
