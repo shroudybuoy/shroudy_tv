@@ -1920,13 +1920,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
   }
 
-  Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
+    Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
     VlcVideoFit newFit;
 
-    // "Fit to screen" intentionally stretches the stream to the complete
-    // available player rectangle in both normal and fullscreen modes.
-    // 16:9 and 4:3 use `cover` so the stream fills the selected rectangle
-    // and any overflow is cropped, rather than letterboxing inside it.
     newFit = aspect == 'Fit to screen'
         ? VlcVideoFit.fill
         : VlcVideoFit.cover;
@@ -1943,12 +1939,21 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     _aspectNotifier.value = aspect;
 
     try {
-      // Apply the selected audio track. null means leave the current track alone.
+      if (aspect == 'Fit to screen') {
+        // Fetch the active window size of the iPad screen
+        final size = MediaQuery.of(context).size;
+        final screenRatio = size.width / size.height;
+        // Pass the string format that native VLC expects (e.g., "1.433:1")
+        await _controller.setAspectRatio('${screenRatio.toStringAsFixed(3)}:1');
+      } else {
+        // Reset or apply specific constraints for explicit selections
+        await _controller.setAspectRatio(aspect);
+      }
+
       if (audioId != null) {
         await _controller.setAudioTrack(audioId);
       }
 
-      // Selecting "None" must actually disable subtitles.
       if (subtitleId == null) {
         await _controller.disableSubtitle();
       } else {
@@ -1960,6 +1965,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
     _showControlsTemporarily();
   }
+
 
   // True once shutdown() has torn down the native audio/VLC resources. dispose()
   // checks this so it does not repeat (and race) the same native calls.
