@@ -1557,27 +1557,37 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   void _createController(String url) {
-    _controller = VlcPlayerController(
-      mediaSource: VlcMediaSource(
-        uri: Uri.parse(url),
-        mediaOptions: const [
-          ':network-caching=1000',
-          ':live-caching=1000',
-          ':file-caching=1000',
-          ':http-reconnect=true',
-          ':clock-jitter=0',
-          ':clock-synchro=0',
-        ],
-      ),
-      autoPlay: true,
-    );
-    _controller.addListener(_playerListener);
-    _isPlaying = true;
-    _userPaused = false;
-    _showBuffering = true;
-    _scheduleBufferingWatchdog();
-    _playingNotifier.value = true;
-  }
+  _controller = VlcPlayerController(
+    mediaSource: VlcMediaSource(
+      uri: Uri.parse(url),
+      mediaOptions: const [
+        ':network-caching=1000',
+        ':live-caching=1000',
+        ':file-caching=1000',
+        ':http-reconnect=true',
+        ':clock-jitter=0',
+        ':clock-synchro=0',
+      ],
+    ),
+    autoPlay: true,
+  );
+  
+  _controller.addListener(_playerListener);
+  _isPlaying = true;
+  _userPaused = false;
+  _showBuffering = true;
+  _scheduleBufferingWatchdog();
+  _playingNotifier.value = true;
+
+  // Force the native aspect setting right after player framework creation
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    if (mounted && _selectedAspectRatio == 'Fit to screen') {
+      final size = MediaQuery.of(context).size;
+      await _controller.setAspectRatio('${size.width.round()}:${size.height.round()}');
+    }
+  });
+}
+
 
   void _scheduleBufferingWatchdog() {
     _bufferingTimer?.cancel();
@@ -1907,45 +1917,55 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
-    VlcVideoFit newFit;
+  VlcVideoFit newFit;
+  String vlcAspectString = ''; // '' tells VLC to reset to native track settings
 
-    // "Fit to screen" intentionally stretches the stream to the complete
-    // available player rectangle in both normal and fullscreen modes.
-    // 16:9 and 4:3 use `cover` so the stream fills the selected rectangle
-    // and any overflow is cropped, rather than letterboxing inside it.
-    newFit = aspect == 'Fit to screen'
-        ? VlcVideoFit.fill
-        : VlcVideoFit.cover;
-
-    if (mounted) {
-      setState(() {
-        _selectedAspectRatio = aspect;
-        _selectedAudioTrackId = audioId;
-        _selectedSubtitleTrackId = subtitleId;
-        _currentFit = newFit;
-      });
-    }
-    _fitNotifier.value = newFit;
-    _aspectNotifier.value = aspect;
-
-    try {
-      // Apply the selected audio track. null means leave the current track alone.
-      if (audioId != null) {
-        await _controller.setAudioTrack(audioId);
-      }
-
-      // Selecting "None" must actually disable subtitles.
-      if (subtitleId == null) {
-        await _controller.disableSubtitle();
-      } else {
-        await _controller.setSubtitleTrack(subtitleId);
-      }
-    } catch (e) {
-      debugPrint('Track selection error: $e');
-    }
-
-    _showControlsTemporarily();
+  if (aspect == 'Fit to screen') {
+    newFit = VlcVideoFit.fill;
+    // Force native VLC media unit to stretch to the hardware screen layout constraints
+    vlcAspectString = '16:9'; // Or match your exact device container window context e.g. '16:9'
+  } else {
+    newFit = VlcVideoFit.cover;
+    vlcAspectString = aspect; // Uses '16:9' or '4:3' explicitly
   }
+
+  if (mounted) {
+    setState(() {
+      _selectedAspectRatio = aspect;
+      _selectedAudioTrackId = audioId;
+      _selectedSubtitleTrackId = subtitleId;
+      _currentFit = newFit;
+    });
+  }
+  _fitNotifier.value = newFit;
+  _aspectNotifier.value = aspect;
+
+  try {
+    // THIS LINE FIXES IT: Forces native media surface to physically stretch edge-to-edge
+    if (aspect == 'Fit to screen') {
+      // Accessing media dimension aspect overrides
+      final size = MediaQuery.of(context).size;
+      await _controller.setAspectRatio('${size.width.round()}:${size.height.round()}');
+    } else {
+      await _controller.setAspectRatio(vlcAspectString);
+    }
+
+    if (audioId != null) {
+      await _controller.setAudioTrack(audioId);
+    }
+
+    if (subtitleId == null) {
+      await _controller.disableSubtitle();
+    } else {
+      await _controller.setSubtitleTrack(subtitleId);
+    }
+  } catch (e) {
+    debugPrint('Track or aspect selection error: $e');
+  }
+
+  _showControlsTemporarily();
+}
+
 
   // True once shutdown() has torn down the native audio/VLC resources. dispose()
   // checks this so it does not repeat (and race) the same native calls.
