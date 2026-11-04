@@ -476,6 +476,11 @@ class _MainDashboardState extends State<MainDashboard> {
   /// guides cannot bury the comprehensive one — a later source's title wins
   /// when merging.
   ///
+  /// `epg_ripper_IN4` is listed last on purpose: it is keyed the way this
+  /// playlist is written (STAR.PLUS.in, ZEE.TV.HD.in, NICK.in) and covers 94 of
+  /// its 164 channels, against 47 for the 65 MB IN1 guide, so where both carry a
+  /// channel the playlist-native listing should be the one that shows.
+  ///
   /// `iptv-epg.org/files/epg-in.xml.gz` is deliberately excluded: every one of
   /// its 30,168 programmes is a `<title>No Data</title>` placeholder, so it only
   /// ever cost bandwidth and overwrote real titles.
@@ -483,6 +488,7 @@ class _MainDashboardState extends State<MainDashboard> {
         if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
         'https://epgshare01.online/epgshare01/epg_ripper_IN2.xml.gz',
         'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
+        'https://epgshare01.online/epgshare01/epg_ripper_IN4.xml.gz',
       }.toList();
 
   /// Runs a guide sweep on a background isolate.
@@ -2674,6 +2680,11 @@ const Set<String> _epgNoiseTokens = {
   'stream', 'feed',
 };
 
+/// The quality words inside [epgNoiseTokens]. They say nothing about which
+/// channel a name means, but when two guide feeds tie they pick between the HD
+/// and the SD row of the same channel.
+const Set<String> _epgQualityTokens = {'hd', 'sd', 'fhd', 'hdr', '4k', 'uhd'};
+
 /// Words that DO separate channels. Indian packages run the same brand in many
 /// languages, so "Star Sports 1 Hindi" and "Star Sports 1 Tamil" are different
 /// channels and must never borrow each other's schedule.
@@ -2731,6 +2742,13 @@ class _GuideChannelEntry {
   final Set<String> digits;
   final Set<String> languages;
 
+  /// The XMLTV id reduced to `colorssd`, for comparing against the playlist's
+  /// own id, which is the same channel written the other way round.
+  final String idSquash;
+
+  /// The words of the XMLTV id, with camel-packed ones split apart.
+  final Set<String> idWords;
+
   const _GuideChannelEntry({
     required this.id,
     required this.programmes,
@@ -2740,6 +2758,8 @@ class _GuideChannelEntry {
     required this.tokenCount,
     required this.digits,
     required this.languages,
+    required this.idSquash,
+    required this.idWords,
   });
 
   /// True when the two names name different variants of the brand. A conflict
@@ -2764,11 +2784,17 @@ class _ChannelProfile {
   final Set<String> digits;
   final Set<String> languages;
 
+  /// `HD`/`SD`/`4K` in the playlist name. These are noise for telling one
+  /// channel from another, but they are the only clue about which feed of the
+  /// same channel the row wants, so they break ties instead of being dropped.
+  final Set<String> qualities;
+
   const _ChannelProfile._({
     required this.squashed,
     required this.coreTokens,
     required this.digits,
     required this.languages,
+    required this.qualities,
   });
 
   factory _ChannelProfile.of(String name) {
@@ -2778,8 +2804,38 @@ class _ChannelProfile {
       coreTokens: tokens.difference(_epgNoiseTokens),
       digits: _epgDigits(name),
       languages: tokens.intersection(_epgLanguageTokens),
+      qualities: tokens.intersection(_epgQualityTokens),
     );
   }
+}
+
+/// Drops a trailing country suffix (`.in`, `.in2`, `.us`) and everything that is
+/// not a letter or digit, so `Colors.SD.in` and `Colors.in@SD` can be compared.
+String _epgIdSquash(String value) => _epgIdBody(value)
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+/// The words of an id, with camel-packed ones split: a playlist writes
+/// `SonyEntertainmentTelevision.in` where a guide writes `Sony.ET.in`, and the
+/// two only line up once both are read as `sony entertainment television`.
+Set<String> _epgIdWords(String value) => _epgIdBody(value)
+    .replaceAllMapped(
+        RegExp(r'([a-z0-9])([A-Z])'), (match) => '${match[1]} ${match[2]}')
+    .replaceAllMapped(
+        RegExp(r'([A-Z]+)([A-Z][a-z])'), (match) => '${match[1]} ${match[2]}')
+    .split(RegExp(r'[^A-Za-z0-9]+'))
+    .where((word) => word.length >= 2)
+    .map((word) => word.toLowerCase())
+    .toSet()
+    .difference(_epgNoiseTokens);
+
+String _epgIdBody(String value) {
+  final parts = value.split('.');
+  if (parts.length > 1 &&
+      RegExp(r'^[a-z]{2}\d?$').hasMatch(parts.last.toLowerCase())) {
+    parts.removeLast();
+  }
+  return parts.join('.');
 }
 
 /// Normalised view of every guide channel that actually carries programme data.
@@ -2833,6 +2889,8 @@ Map<String, _GuideChannelEntry> _indexGuideChannels(
           .reduce((a, b) => a < b ? a : b),
       digits: _epgDigits(names.join(' ')),
       languages: tokens.intersection(_epgLanguageTokens),
+      idSquash: _epgIdSquash(id),
+      idWords: _epgIdWords(id),
     );
   }
 
@@ -2921,7 +2979,10 @@ _GuideChannelEntry? _matchGuideChannel(
     }
 
     if (score >= 90) {
-      if (score > bestScore) {
+      if (score > bestScore ||
+          (score == bestScore &&
+              best != null &&
+              _epgPrefers(entry, best, profile.qualities))) {
         bestScore = score;
         best = entry;
       }
@@ -2946,8 +3007,94 @@ _GuideChannelEntry? _matchGuideChannel(
 
   if (best != null) return best;
   if (looseCount == 1) return loose;
-  return fillerCount == 1 ? filler : null;
+  if (fillerCount == 1) return filler;
+  return _matchGuideChannelById(channel.tvgId, profile, byId);
 }
+
+/// Use the playlist's own `tvg-id` when its display name matched nothing, after
+/// normalising the two ways of writing the same channel.
+///
+/// Public Indian playlists are keyed to a different guide than the ones the app
+/// reads, so `Colors.in@HD` never appears verbatim in an epg-ripper file: the
+/// raw lookup above misses and the schedule has to come from a normalised id.
+/// A candidate set that the quality suffix cannot narrow to one feed is refused
+/// rather than guessed, since guessing between sibling feeds is what shows a
+/// different channel's programmes.
+_GuideChannelEntry? _matchGuideChannelById(
+  String rawId,
+  _ChannelProfile profile,
+  Map<String, _GuideChannelEntry> byId,
+) {
+  final trimmed = rawId.trim();
+  if (trimmed.isEmpty) return null;
+  final at = trimmed.indexOf('@');
+  final stem = (at < 0 ? trimmed : trimmed.substring(0, at)).trim();
+  final quality = at < 0 ? '' : trimmed.substring(at + 1).trim().toLowerCase();
+  final squash = _epgIdSquash(stem);
+  final words = _epgIdWords(stem);
+  if (squash.isEmpty) return null;
+
+  final exact = <_GuideChannelEntry>[];
+  final prefixed = <_GuideChannelEntry>[];
+  final worded = <_GuideChannelEntry>[];
+  for (final entry in byId.values) {
+    // Public lists copy ids between sibling feeds ("StarSports2.in" used for
+    // Star Sports 1), so an id is only trusted while the guide's name agrees
+    // with what the playlist channel itself says.
+    if (entry.conflictsWith(profile.digits, profile.languages)) continue;
+    if (entry.idSquash == squash) {
+      exact.add(entry);
+    } else if (entry.idSquash.startsWith(squash)) {
+      prefixed.add(entry);
+    } else if (words.isNotEmpty) {
+      for (final guideWords in [entry.idWords, entry.coreTokens]) {
+        if (guideWords.length == words.length &&
+            guideWords.containsAll(words)) {
+          worded.add(entry);
+          break;
+        }
+      }
+    }
+  }
+
+  var candidates =
+      exact.isNotEmpty ? exact : (prefixed.isNotEmpty ? prefixed : worded);
+  if (candidates.length > 1 && quality.length >= 2) {
+    final wanted =
+        candidates.where((entry) => _epgHasQuality(entry, quality)).toList();
+    if (wanted.isNotEmpty) candidates = wanted;
+  }
+  if (candidates.length == 1) return candidates.single;
+  if (candidates.isEmpty) return null;
+
+  // Still several feeds: take the plainest alias only when one is plainer than
+  // every other, so "ZEE TV" and "Zee.TV.HD.Canada.in" cannot be confused.
+  candidates.sort((a, b) => a.tokenCount.compareTo(b.tokenCount));
+  return candidates[0].tokenCount < candidates[1].tokenCount
+      ? candidates[0]
+      : null;
+}
+
+/// Which of two equally-named guide feeds a playlist row more likely wants: the
+/// one carrying the quality the row names, and failing that the least decorated
+/// alias, which is the channel itself rather than a UK/USA/Canada version of it.
+bool _epgPrefers(
+  _GuideChannelEntry candidate,
+  _GuideChannelEntry current,
+  Set<String> qualities,
+) {
+  final wanted = _epgHasAnyQuality(candidate, qualities) ? 1 : 0;
+  final held = _epgHasAnyQuality(current, qualities) ? 1 : 0;
+  if (wanted != held) return wanted > held;
+  return candidate.tokenCount < current.tokenCount;
+}
+
+bool _epgHasAnyQuality(_GuideChannelEntry entry, Set<String> qualities) =>
+    qualities.any((quality) => _epgHasQuality(entry, quality));
+
+bool _epgHasQuality(_GuideChannelEntry entry, String quality) =>
+    entry.id.toLowerCase().contains(quality) ||
+    entry.squashedNames.any((name) => name.contains(quality));
 
 /// True when both names number their feeds the same way. A playlist that says
 /// "Sony Max" must not be handed "Sony Max 2", whose schedule is different,
