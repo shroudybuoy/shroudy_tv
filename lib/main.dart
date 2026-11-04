@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -13,17 +14,40 @@ import 'package:vlc_player/vlc_player.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // Keep channel logos in memory for the whole app session so each one is
-  // downloaded once and never re-fetched until the app is closed. Flutter's
-  // ImageCache is in-memory only (cleared on process exit) and is what
-  // Image.network uses under the hood.
-  PaintingBinding.instance.imageCache.maximumSize = 2000;
-  PaintingBinding.instance.imageCache.maximumSizeBytes = 256 << 20; // 256 MB
+  // downloaded once and never re-fetched until the app is closed. The size is
+  // capped because an unbounded cache is a memory-kill risk on iPad once
+  // programme artwork is added to the same cache.
+  PaintingBinding.instance.imageCache.maximumSize = 800;
+  PaintingBinding.instance.imageCache.maximumSizeBytes = 64 << 20; // 64 MB
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
     DeviceOrientation.portraitUp,
   ]);
   runApp(const ShroudyTvApp());
+}
+
+const String _playlistUrl =
+    'https://raw.githubusercontent.com/shroudybuoy/TV-Channels/refs/heads/main/channel%20playlist.m3u';
+
+const String _aspectRatioPrefKey = 'aspect_ratio';
+const String _favoriteNamesPrefKey = 'favorite_names';
+
+const String _aspectFitToScreen = 'Fit to screen';
+const String _aspect16x9 = '16:9';
+const String _aspect4x3 = '4:3';
+
+/// "Fit to screen" stretches the stream across the whole player rectangle.
+/// Fixed ratios use `cover` so the selected box is filled and overflow is
+/// cropped, rather than letterboxed inside it.
+VlcVideoFit fitForAspectRatio(String aspect) =>
+    aspect == _aspectFitToScreen ? VlcVideoFit.fill : VlcVideoFit.cover;
+
+/// Key used to store and look up a channel's EPG entry. Channels that declare
+/// a `tvg-id` are matched by it; the rest fall back to their display name.
+String epgKeyFor(ChannelItem channel) {
+  final id = channel.tvgId.trim();
+  return id.isNotEmpty ? id : channel.name;
 }
 
 class ShroudyColors {
@@ -52,6 +76,28 @@ class ChannelItem {
   });
 }
 
+/// Channel logo with an empty-URL guard. The grid cards used to pass `''`
+/// straight to `Image.network`, which threw for every playlist entry that has no
+/// `logo=` attribute.
+class _ChannelLogo extends StatelessWidget {
+  final String url;
+
+  const _ChannelLogo({required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    if (url.trim().isEmpty) {
+      return const Icon(Icons.tv, color: Colors.white, size: 30);
+    }
+    return Image.network(
+      url,
+      fit: BoxFit.contain,
+      errorBuilder: (_, _, _) =>
+          const Icon(Icons.tv, color: Colors.white, size: 30),
+    );
+  }
+}
+
 class EpgProgram {
   final DateTime start;
   final DateTime stop;
@@ -77,6 +123,20 @@ class EpgData {
     this.now,
     this.next,
     this.upcoming = const [],
+  });
+}
+
+/// Result of parsing one M3U body, kept separate from widget state so a
+/// refresh replaces the whole listing atomically.
+class _ParsedPlaylist {
+  final List<ChannelItem> channels;
+  final List<String> categories;
+  final String? epgUrl;
+
+  const _ParsedPlaylist({
+    required this.channels,
+    required this.categories,
+    this.epgUrl,
   });
 }
 
@@ -236,10 +296,25 @@ class _MainDashboardState extends State<MainDashboard> {
   Timer? _epgRefreshTimer;
   String? _playlistEpgUrl;
 
+  // Playlist loading state. A failed or slow fetch used to leave the app on
+  // the splash screen forever, so the request is now bounded by a timeout and
+  // the failure is surfaced with a retry action.
+  bool _loadingPlaylist = false;
+  String? _playlistError;
+
+  // EPG fetching state. A full guide sweep pulls tens of megabytes, so only one
+  // sweep may be in flight at a time, and channels that no source can match are
+  // retired instead of being retried every cycle.
+  bool _epgRunning = false;
+  final Set<String> _epgExhaustedKeys = {};
+
   // Boot splash timing: keep it on screen for at least _minBootDuration so the
   // animation plays out even when the playlist loads almost instantly.
   final DateTime _bootStart = DateTime.now();
   static const Duration _minBootDuration = Duration(milliseconds: 2200);
+
+  // How long the on-screen boot animation is held for.
+  static const Duration _epgRefreshInterval = Duration(minutes: 15);
 
   // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
   // that toggling it only changes the layout around the player. The player
@@ -253,7 +328,7 @@ class _MainDashboardState extends State<MainDashboard> {
   void initState() {
     super.initState();
     _fetchM3uPlaylist();
-    _epgRefreshTimer = Timer.periodic(const Duration(minutes: 1), (_) => _refreshCurrentEpg());
+    _epgRefreshTimer = Timer.periodic(_epgRefreshInterval, (_) => _fetchEpg());
   }
 
   // Waits out the remaining minimum boot time (if any), then reveals the UI.
@@ -265,488 +340,180 @@ class _MainDashboardState extends State<MainDashboard> {
   }
 
   Future<void> _fetchM3uPlaylist() async {
+    if (_loadingPlaylist) return;
+    setState(() {
+      _loadingPlaylist = true;
+      _playlistError = null;
+    });
     try {
-      final response = await http.get(Uri.parse(
-        'https://raw.githubusercontent.com/shroudybuoy/TV-Channels/refs/heads/main/channel%20playlist.m3u',
-      ));
+      final response = await http
+          .get(Uri.parse(_playlistUrl))
+          .timeout(const Duration(seconds: 30));
 
-      if (response.statusCode == 200) {
-        final lines = response.body.split('\n');
-        String currentName = '';
-        String currentLogo = '';
-        String currentCategory = 'Uncategorized';
-        String currentTvgId = '';
-        final categoriesSet = <String>{};
-
-        // Use the EPG URL declared by the playlist header.
-        for (final raw in lines.take(10)) {
-          final header = raw.trim();
-          if (header.toUpperCase().startsWith('#EXTM3U')) {
-            final declaredEpg = _extractAttribute(header, 'x-tvg-url');
-            if (declaredEpg.isNotEmpty) {
-              _playlistEpgUrl = declaredEpg;
-              break;
-            }
-          }
-        }
-
-        for (var line in lines) {
-          final cleanLine = line.trim().replaceAll('\r', '');
-          if (cleanLine.isEmpty) continue;
-
-          if (cleanLine.toUpperCase().startsWith('#EXTINF:')) {
-            currentName = _extractAttribute(cleanLine, 'tvg-name');
-
-            if (currentName.isEmpty) {
-              final commaIndex = cleanLine.lastIndexOf(',');
-              if (commaIndex >= 0) {
-                currentName = cleanLine.substring(commaIndex + 1).trim();
-              }
-            }
-
-            currentLogo = _extractAttribute(cleanLine, 'logo');
-            currentCategory = _extractAttribute(cleanLine, 'group-title');
-            currentTvgId = _extractAttribute(cleanLine, 'tvg-id');
-
-            if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
-            categoriesSet.add(currentCategory);
-          } else if (!cleanLine.startsWith('#')) {
-            if (cleanLine.startsWith('http://') || cleanLine.startsWith('https://')) {
-              _allChannelsList.add(
-                ChannelItem(
-                  name: currentName.isEmpty ? 'Unknown Channel' : currentName,
-                  logoUrl: currentLogo,
-                  streamUrl: cleanLine,
-                  category: currentCategory,
-                  tvgId: currentTvgId,
-                ),
-              );
-              currentName = '';
-              currentLogo = '';
-              currentTvgId = '';
-            }
-          }
-        }
-
-        final prefs = await SharedPreferences.getInstance();
-        final savedFavs = prefs.getStringList('favorite_names') ?? [];
-
-        if (!mounted) return;
-        setState(() {
-          _favoritesList.addAll(savedFavs);
-          _categoriesList.addAll(categoriesSet.toList()..sort());
-        });
-        _fetchEpg();
-        await _finishBoot();
-      } else {
-        await _finishBoot();
+      if (response.statusCode != 200) {
+        throw StateError(
+          'Playlist request failed (HTTP ${response.statusCode}).',
+        );
       }
+
+      final parsed = _parsePlaylist(response.body);
+      final prefs = await SharedPreferences.getInstance();
+
+      if (!mounted) return;
+      setState(() {
+        _allChannelsList
+          ..clear()
+          ..addAll(parsed.channels);
+        _categoriesList
+          ..clear()
+          ..add('All')
+          ..addAll(parsed.categories);
+        _playlistEpgUrl = parsed.epgUrl;
+        _favoritesList
+          ..clear()
+          ..addAll(prefs.getStringList(_favoriteNamesPrefKey) ?? const []);
+      });
+
+      _fetchEpg();
+      await _finishBoot();
     } catch (e) {
       debugPrint('Playlist error: $e');
+      if (!mounted) return;
+      setState(() => _playlistError = '$e');
       await _finishBoot();
+    } finally {
+      if (mounted) setState(() => _loadingPlaylist = false);
     }
   }
 
+  // Pure: no widget state is touched here, so a re-parse cannot leave half
+  // populated lists behind when the playlist changes shape between fetches.
+  _ParsedPlaylist _parsePlaylist(String body) {
+    final channels = <ChannelItem>[];
+    final categoriesSet = <String>{};
+    String? epgUrl;
 
-  DateTime? _parseXmltvDate(String? raw) {
-    if (raw == null) return null;
-    final value = raw.trim();
-    try {
-      return DateTime.parse(value).toLocal();
-    } catch (_) {}
+    final lines = body.split('\n');
 
-    // XMLTV commonly uses: yyyyMMddHHmmss +0000 / yyyyMMddHHmmss -0500
-    final match = RegExp(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?$').firstMatch(value);
-    if (match == null) return null;
-
-    final year = int.parse(match.group(1)!);
-    final month = int.parse(match.group(2)!);
-    final day = int.parse(match.group(3)!);
-    final hour = int.parse(match.group(4)!);
-    final minute = int.parse(match.group(5)!);
-    final second = int.parse(match.group(6)!);
-    final sign = match.group(7);
-    final tzHour = int.tryParse(match.group(8) ?? '0') ?? 0;
-    final tzMinute = int.tryParse(match.group(9) ?? '0') ?? 0;
-
-    if (sign == null) {
-      return DateTime(year, month, day, hour, minute, second);
-    }
-
-    final offset = Duration(hours: tzHour, minutes: tzMinute);
-    final utc = DateTime.utc(year, month, day, hour, minute, second);
-    return (sign == '+') ? utc.subtract(offset).toLocal() : utc.add(offset).toLocal();
-  }
-
-  String _normalizeEpgName(String value) {
-    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
-    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
-    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
-    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
-  }
-
-  String _epgNameKey(String value) {
-    var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
-    v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
-    v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
-
-    // Normalize common provider/channel-name differences so the same
-    // channel can be matched even when M3U and XMLTV use different labels.
-    v = v.replaceAll(RegExp(r'\bfull hd\b'), ' ');
-    v = v.replaceAll(RegExp(r'\bhigh definition\b'), ' ');
-    v = v.replaceAll(RegExp(r'\b(\d+\s*)?(hd|sd)\b'), ' ');
-    v = v.replaceAll(RegExp(r'\b(india|indian|tv channel|channel)\b'), ' ');
-    v = v.replaceAll(RegExp(r'\s+'), ' ').trim();
-
-    return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
-  }
-
-  String _decodeXmlText(String value) {
-    return value
-        .replaceAll('&amp;', '&')
-        .replaceAll('&quot;', '"')
-        .replaceAll('&apos;', "'")
-        .replaceAll('&lt;', '<')
-        .replaceAll('&gt;', '>')
-        .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.tryParse(m.group(1)!) ?? 32));
-  }
-
-  String _cleanEpgText(String value) {
-    return _decodeXmlText(value.replaceAll(RegExp(r'<[^>]+>'), '').trim());
-  }
-
-  String _englishXmlText(String body, String tag) {
-    final matches = RegExp(
-      '<$tag\\b([^>]*)>(.*?)</$tag\\s*>',
-      caseSensitive: false,
-      dotAll: true,
-    ).allMatches(body);
-
-    String? firstText;
-    for (final match in matches) {
-      final attrs = match.group(1) ?? '';
-      final text = _cleanEpgText(match.group(2) ?? '');
-      if (text.isEmpty) continue;
-      firstText ??= text;
-
-      final langMatch = RegExp(
-        r'''\blang\s*=\s*["']([^"']+)["']''',
-        caseSensitive: false,
-      ).firstMatch(attrs);
-      final lang = langMatch?.group(1)?.toLowerCase() ?? '';
-
-      if (lang == 'en' ||
-          lang.startsWith('en-') ||
-          lang.startsWith('en_') ||
-          lang == 'eng' ||
-          lang == 'english') {
-        return text;
-      }
-    }
-    return firstText ?? '';
-  }
-
-  String? _xmlIconUrl(String body) {
-    final match = RegExp(
-      r'''<icon\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>''',
-      caseSensitive: false,
-    ).firstMatch(body);
-    final value = match?.group(1)?.trim();
-    return value == null || value.isEmpty ? null : _decodeXmlText(value);
-  }
-
-  Future<void> _fetchEpg() async {
-    final urls = <String>[
-      if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
-      'https://iptv-org.github.io/epg/guides/in.xml.gz',
-      'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
-      'https://iptv-epg.org/files/epg-in.xml.gz',
-    ].toSet().toList();
-
-    // Do NOT stop after the first working EPG source.
-    // A source can be reachable but contain only a small subset of channels.
-    // We merge matches from every source so sparse EPG files can fill gaps.
-    final merged = <String, EpgData>{};
-
-    EpgData buildData(List<EpgProgram>? source) {
-      if (source == null || source.isEmpty) {
-        return const EpgData();
-      }
-
-      final sorted = List<EpgProgram>.from(source)
-        ..sort((a, b) => a.start.compareTo(b.start));
-
-      final now = DateTime.now();
-      EpgProgram? current;
-      final future = <EpgProgram>[];
-
-      for (final program in sorted) {
-        if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
-          current ??= program;
-        } else if (program.start.isAfter(now)) {
-          future.add(program);
+    // Use the EPG URL declared by the playlist header.
+    for (final header in lines.take(10).map((l) => l.trim())) {
+      if (header.toUpperCase().startsWith('#EXTM3U')) {
+        final declaredEpg = _extractAttribute(header, 'x-tvg-url');
+        if (declaredEpg.isNotEmpty) {
+          epgUrl = declaredEpg;
+          break;
         }
       }
-
-      return EpgData(
-        now: current,
-        next: future.isNotEmpty ? future.first : null,
-        upcoming: future.take(6).toList(),
-      );
     }
 
-    bool hasUsefulData(EpgData data) =>
-        data.now != null || data.next != null || data.upcoming.isNotEmpty;
+    String currentName = '';
+    String currentLogo = '';
+    String currentCategory = 'Uncategorized';
+    String currentTvgId = '';
 
-    EpgProgram? mergeProgram(EpgProgram? preferred, EpgProgram? fallback) {
-      if (preferred == null) return fallback;
-      if (fallback == null) return preferred;
-      return EpgProgram(
-        start: preferred.start,
-        stop: preferred.stop,
-        title: preferred.title,
-        description: preferred.description.isNotEmpty
-            ? preferred.description
-            : fallback.description,
-        imageUrl: preferred.imageUrl?.isNotEmpty == true
-            ? preferred.imageUrl
-            : fallback.imageUrl,
-      );
-    }
+    for (final raw in lines) {
+      final cleanLine = raw.trim().replaceAll('\r', '');
+      if (cleanLine.isEmpty) continue;
 
-    EpgData mergeData(EpgData oldData, EpgData newData) {
-      final now = mergeProgram(newData.now, oldData.now);
-      final next = mergeProgram(newData.next, oldData.next);
+      if (cleanLine.toUpperCase().startsWith('#EXTINF:')) {
+        currentName = _extractAttribute(cleanLine, 'tvg-name');
 
-      final allUpcoming = <String, EpgProgram>{};
-      for (final p in oldData.upcoming) {
-        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
-      }
-      for (final p in newData.upcoming) {
-        allUpcoming['${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}'] = p;
-      }
-
-      final upcoming = allUpcoming.values.toList()
-        ..sort((a, b) => a.start.compareTo(b.start));
-
-      return EpgData(
-        now: now,
-        next: next,
-        upcoming: upcoming.take(6).toList(),
-      );
-    }
-
-    for (final url in urls) {
-      try {
-        final response = await http
-            .get(Uri.parse(url))
-            .timeout(const Duration(seconds: 25));
-
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          debugPrint('EPG source HTTP ${response.statusCode}: $url');
-          continue;
-        }
-
-        String xml;
-        final bytes = response.bodyBytes;
-        if (bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
-          xml = utf8.decode(GZipCodec().decode(bytes), allowMalformed: true);
-        } else {
-          xml = utf8.decode(bytes, allowMalformed: true);
-        }
-
-        final channelNames = <String, String>{};
-
-        final channelRegex = RegExp(
-          r'<channel\b[^>]*\bid\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r'][^>]*>(.*?)</channel\s*>',
-          caseSensitive: false,
-          dotAll: true,
-        );
-
-        final displayRegex = RegExp(
-          r'<display-name\b[^>]*>(.*?)</display-name\s*>',
-          caseSensitive: false,
-          dotAll: true,
-        );
-
-        for (final m in channelRegex.allMatches(xml)) {
-          final id = m.group(1)!.trim();
-          final body = m.group(2)!;
-          final dm = displayRegex.firstMatch(body);
-          if (dm != null) {
-            channelNames[id] = _decodeXmlText(
-              dm.group(1)!.replaceAll(RegExp(r'<[^>]+>'), '').trim(),
-            );
+        if (currentName.isEmpty) {
+          final commaIndex = cleanLine.lastIndexOf(',');
+          if (commaIndex >= 0) {
+            currentName = cleanLine.substring(commaIndex + 1).trim();
           }
         }
 
-        final programmes = <String, List<EpgProgram>>{};
+        currentLogo = _extractAttribute(cleanLine, 'logo');
+        currentCategory = _extractAttribute(cleanLine, 'group-title');
+        currentTvgId = _extractAttribute(cleanLine, 'tvg-id');
 
-        // Match programme elements regardless of attribute ordering and
-        // support both single- and double-quoted XML attributes.
-        final programmeRegex = RegExp(
-          r'<programme\b([^>]*)>(.*?)</programme\s*>',
-          caseSensitive: false,
-          dotAll: true,
-        );
-
-        final channelAttr = RegExp(
-          r'\bchannel\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
-          caseSensitive: false,
-        );
-        final attrStart = RegExp(
-          r'\bstart\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
-          caseSensitive: false,
-        );
-        final attrStop = RegExp(
-          r'\bstop\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']',
-          caseSensitive: false,
-        );
-        for (final m in programmeRegex.allMatches(xml)) {
-          final attrs = m.group(1)!;
-          final body = m.group(2)!;
-
-          final channelId = channelAttr.firstMatch(attrs)?.group(1)?.trim();
-          final startRaw = attrStart.firstMatch(attrs)?.group(1);
-          final stopRaw = attrStop.firstMatch(attrs)?.group(1);
-
-          if (channelId == null ||
-              channelId.isEmpty ||
-              startRaw == null ||
-              stopRaw == null) {
-            continue;
-          }
-
-          final start = _parseXmltvDate(startRaw);
-          final stop = _parseXmltvDate(stopRaw);
-          if (start == null || stop == null || !stop.isAfter(start)) continue;
-
-          // Prefer the English XMLTV title when the provider supplies one.
-          // If no English field exists, retain the provider's first title.
-          final title = _englishXmlText(body, 'title');
-          if (title.isEmpty) continue;
-
-          final description = _englishXmlText(body, 'desc');
-          final imageUrl = _xmlIconUrl(body);
-
-          (programmes[channelId] ??= []).add(
-            EpgProgram(
-              start: start,
-              stop: stop,
-              title: title,
-              description: description,
-              imageUrl: imageUrl,
+        if (currentCategory.isEmpty) currentCategory = 'Uncategorized';
+        categoriesSet.add(currentCategory);
+      } else if (!cleanLine.startsWith('#')) {
+        if (cleanLine.startsWith('http://') || cleanLine.startsWith('https://')) {
+          channels.add(
+            ChannelItem(
+              name: currentName.isEmpty ? 'Unknown Channel' : currentName,
+              logoUrl: currentLogo,
+              streamUrl: cleanLine,
+              category: currentCategory,
+              tvgId: currentTvgId,
             ),
           );
+          currentName = '';
+          currentLogo = '';
+          currentTvgId = '';
+          currentCategory = 'Uncategorized';
         }
-
-        // Create a normalized display-name index for this source.
-        final byName = <String, List<EpgProgram>>{};
-        programmes.forEach((id, list) {
-          final display = channelNames[id];
-          if (display == null || display.trim().isEmpty) return;
-
-          final key = _epgNameKey(display);
-          if (key.isNotEmpty) {
-            (byName[key] ??= <EpgProgram>[]).addAll(list);
-          }
-        });
-
-        for (final channel in _allChannelsList) {
-          final resultKey = channel.tvgId.trim().isNotEmpty
-              ? channel.tvgId.trim()
-              : channel.name;
-
-          List<EpgProgram>? matched;
-
-          // 1. Exact tvg-id match.
-          final id = channel.tvgId.trim();
-          if (id.isNotEmpty) {
-            matched = programmes[id];
-            if (matched == null) {
-              for (final entry in programmes.entries) {
-                if (entry.key.toLowerCase() == id.toLowerCase()) {
-                  matched = entry.value;
-                  break;
-                }
-              }
-            }
-          }
-
-          // 2. Exact normalized channel-name match.
-          final channelKey = _epgNameKey(channel.name);
-          matched ??= byName[channelKey];
-
-          // 3. Fuzzy normalized-name match for provider naming differences.
-          if (matched == null && channelKey.isNotEmpty) {
-            int bestScore = 0;
-            for (final entry in byName.entries) {
-              final epgKey = entry.key;
-              int score = 0;
-
-              if (epgKey == channelKey) {
-                score = 100;
-              } else if (epgKey.contains(channelKey) || channelKey.contains(epgKey)) {
-                score = 80;
-              } else {
-                final channelTokens = _epgTokens(channelKey);
-                final epgTokens = _epgTokens(epgKey);
-                final overlap = channelTokens.intersection(epgTokens).length;
-                if (overlap >= 2) score = 50 + overlap;
-              }
-
-              if (score > bestScore) {
-                bestScore = score;
-                matched = entry.value;
-              }
-            }
-          }
-
-          if (matched == null || matched.isEmpty) continue;
-
-          final data = buildData(matched);
-          if (!hasUsefulData(data)) continue;
-
-          final previous = merged[resultKey];
-          merged[resultKey] =
-              previous == null ? data : mergeData(previous, data);
-        }
-
-        debugPrint(
-          'EPG source parsed: ${programmes.length} XMLTV IDs, '
-          '${merged.length} matched playlist channels from $url',
-        );
-      } catch (e) {
-        debugPrint('EPG source failed $url: $e');
       }
     }
 
-    if (!mounted) return;
-
-    setState(() {
-      _epgByChannel
-        ..clear()
-        ..addAll(merged);
-    });
-
-    debugPrint('EPG merged: ${merged.length}/${_allChannelsList.length} channels');
+    final categories = categoriesSet.toList()..sort();
+    return _ParsedPlaylist(channels: channels, categories: categories, epgUrl: epgUrl);
   }
 
-  Set<String> _epgTokens(String value) {
-    final ignored = <String>{
-      'tv', 'television', 'channel', 'india', 'hd', 'sd',
-      'english', 'hindi', 'live', 'network',
-    };
 
-    return value
-        .split(RegExp(r'[^a-z0-9]+'))
-        .where((e) => e.length >= 2 && !ignored.contains(e))
-        .toSet();
+  // EPG --------------------------------------------------------------------
+
+  /// Guides to try, de-duplicated: the source declared by the playlist header
+  /// first, then the public fallbacks. Ordered cheapest-first so the sparse
+  /// guides cannot bury the comprehensive one — a later source's title wins
+  /// when merging.
+  ///
+  /// `iptv-epg.org/files/epg-in.xml.gz` is deliberately excluded: every one of
+  /// its 30,168 programmes is a `<title>No Data</title>` placeholder, so it only
+  /// ever cost bandwidth and overwrote real titles.
+  List<String> get _epgSourceUrls => <String>{
+        if (_playlistEpgUrl != null && _playlistEpgUrl!.isNotEmpty) _playlistEpgUrl!,
+        'https://epgshare01.online/epgshare01/epg_ripper_IN2.xml.gz',
+        'https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz',
+      }.toList();
+
+  /// Runs a guide sweep on a background isolate.
+  ///
+  /// The Indian guide alone expands to about 65 MB of XML. Fetching and
+  /// regex-matching that on the platform thread stalled the whole UI once a
+  /// minute and pushed iPad memory toward the jetsam limit, so the work now
+  /// happens in `compute()` and only the small matched result crosses back.
+  Future<void> _fetchEpg() async {
+    if (_epgRunning || _allChannelsList.isEmpty) return;
+
+    final pending = _allChannelsList
+        .where((ch) => !_epgExhaustedKeys.contains(epgKeyFor(ch)))
+        .toList();
+    if (pending.isEmpty) return;
+
+    _epgRunning = true;
+    final request = _EpgRequest(
+      urls: _epgSourceUrls,
+      channels: pending
+          .map((ch) => _EpgChannelQuery(name: ch.name, tvgId: ch.tvgId))
+          .toList(),
+    );
+
+    try {
+      final result = await compute(_runEpgSweep, request)
+          .timeout(const Duration(minutes: 3));
+      if (!mounted) return;
+      setState(() {
+        _epgByChannel.addAll(result.byChannel);
+        // Channels no source could match are retired for the session instead of
+        // being re-attempted by every later sweep.
+        _epgExhaustedKeys.addAll(result.exhaustedKeys);
+      });
+      debugPrint(
+        'EPG sweep: ${_epgByChannel.length}/${_allChannelsList.length} channels '
+        'matched, ${_epgExhaustedKeys.length} retired',
+      );
+    } catch (e) {
+      debugPrint('EPG sweep failed: $e');
+    } finally {
+      _epgRunning = false;
+    }
   }
 
-  Future<void> _refreshCurrentEpg() async {
-    if (_allChannelsList.isNotEmpty) await _fetchEpg();
-  }
 
   @override
   void dispose() {
@@ -768,7 +535,7 @@ class _MainDashboardState extends State<MainDashboard> {
         _favoritesList.add(name);
       }
     });
-    await prefs.setStringList('favorite_names', _favoritesList);
+    await prefs.setStringList(_favoriteNamesPrefKey, _favoritesList);
   }
 
   void _setPlayerFullscreen(bool value) {
@@ -870,7 +637,9 @@ class _MainDashboardState extends State<MainDashboard> {
     final filteredChannels = _getFilteredChannels();
 
     Widget body;
-    if (_currentChannel == null) {
+    if (_playlistError != null && _allChannelsList.isEmpty) {
+      body = _buildPlaylistFailureView();
+    } else if (_currentChannel == null) {
       body = _buildStandardBrowsingHubView(filteredChannels);
     } else if (_isPlayerFullscreen) {
       // Same widget instance (same GlobalKey) as inside the split view, so
@@ -895,24 +664,76 @@ class _MainDashboardState extends State<MainDashboard> {
       child: Scaffold(body: body),
     );
   }
-  Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
-    return Column(
-      children: [
-        _buildCategoryAndSearchHeaderRow(),
-        Expanded(
-          child: GridView.builder(
-            padding: const EdgeInsets.all(16),
-            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-              maxCrossAxisExtent: 180,
-              mainAxisSpacing: 16,
-              crossAxisSpacing: 12,
-              childAspectRatio: 1.0,
-            ),
-            itemCount: channels.length,
-            itemBuilder: (context, index) => _buildChannelItemCard(channels[index]),
+
+  /// Shown when the playlist could not be loaded. Previously a failed request
+  /// silently revealed an empty grid with no way back.
+  Widget _buildPlaylistFailureView() {
+    return SafeArea(
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 460),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.wifi_off, color: ShroudyColors.primaryRed, size: 54),
+              const SizedBox(height: 18),
+              const Text(
+                'Channel list could not be loaded',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 19,
+                  fontWeight: FontWeight.bold,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Check the iPad connection and try again.',
+                style: TextStyle(color: Colors.white.withAlpha(170), fontSize: 13),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 22),
+              ElevatedButton.icon(
+                onPressed: _loadingPlaylist ? null : _fetchM3uPlaylist,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: ShroudyColors.primaryRed,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14),
+                ),
+                icon: const Icon(Icons.refresh),
+                label: Text(_loadingPlaylist ? 'Loading…' : 'Retry'),
+              ),
+            ],
           ),
         ),
-      ],
+      ),
+    );
+  }
+
+  Widget _buildStandardBrowsingHubView(List<ChannelItem> channels) {
+    return SafeArea(
+      bottom: false,
+      child: Column(
+        children: [
+          _buildCategoryAndSearchHeaderRow(),
+          Expanded(
+            child: GridView.builder(
+              padding: const EdgeInsets.all(16),
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 180,
+                mainAxisSpacing: 16,
+                crossAxisSpacing: 12,
+                childAspectRatio: 1.0,
+              ),
+              itemCount: channels.length,
+              itemBuilder: (context, index) => _buildChannelItemCard(channels[index]),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -924,7 +745,7 @@ class _MainDashboardState extends State<MainDashboard> {
     ];
 
     return Container(
-      padding: const EdgeInsets.only(top: 40, left: 16, right: 16, bottom: 12),
+      padding: const EdgeInsets.only(top: 12, left: 16, right: 16, bottom: 12),
       child: Column(
         children: [
           SizedBox(
@@ -981,11 +802,7 @@ class _MainDashboardState extends State<MainDashboard> {
                 child: Container(
                   color: ShroudyColors.innerLogoBg,
                   width: double.infinity,
-                  child: Image.network(
-                    channel.logoUrl,
-                    fit: BoxFit.contain,
-                    errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
-                  ),
+                  child: _ChannelLogo(url: channel.logoUrl),
                 ),
               ),
               const SizedBox(height: 6),
@@ -999,10 +816,7 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
   Widget _buildEpgPanel(ChannelItem channel) {
-    final epgKey = channel.tvgId.trim().isNotEmpty
-        ? channel.tvgId.trim()
-        : channel.name;
-    final data = _epgByChannel[epgKey];
+    final data = _epgByChannel[epgKeyFor(channel)];
 
     return SingleChildScrollView(
       child: Column(
@@ -1034,7 +848,7 @@ class _MainDashboardState extends State<MainDashboard> {
                   : Image.network(
                       channel.logoUrl,
                       fit: BoxFit.contain,
-                      errorBuilder: (_, __, ___) =>
+                      errorBuilder: (_, _, _) =>
                           const Icon(Icons.tv, color: Colors.white, size: 34),
                     ),
             ),
@@ -1156,7 +970,7 @@ class _MainDashboardState extends State<MainDashboard> {
                 child: Image.network(
                   imageUrl,
                   fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => Container(
+                  errorBuilder: (_, _, _) => Container(
                     color: Colors.black26,
                     alignment: Alignment.center,
                     child: const Icon(
@@ -1235,7 +1049,7 @@ class _MainDashboardState extends State<MainDashboard> {
                 width: 72,
                 height: 48,
                 fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(
+                errorBuilder: (_, _, _) => Container(
                   width: 72,
                   height: 48,
                   color: Colors.black26,
@@ -1305,10 +1119,12 @@ class _MainDashboardState extends State<MainDashboard> {
         .where((ch) => ch.category == _currentChannel!.category && ch.name != _currentChannel!.name)
         .toList();
 
-    return Column(
+    return SafeArea(
+      bottom: false,
+      child: Column(
       children: [
         Padding(
-          padding: const EdgeInsets.only(top: 40, left: 24, right: 24, bottom: 12),
+          padding: const EdgeInsets.only(top: 12, left: 24, right: 24, bottom: 12),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -1355,7 +1171,9 @@ class _MainDashboardState extends State<MainDashboard> {
                     padding: const EdgeInsets.all(20),
                     decoration: const BoxDecoration(
                       color: ShroudyColors.cardNavyBg,
-                      border: BorderBorder(side: BorderSide(color: ShroudyColors.accentBorder, width: 1)),
+                      border: Border.fromBorderSide(
+                        BorderSide(color: ShroudyColors.accentBorder),
+                      ),
                     ),
                     child: _buildEpgPanel(_currentChannel!),
                   ),
@@ -1399,11 +1217,7 @@ class _MainDashboardState extends State<MainDashboard> {
                                   child: Container(
                                     color: ShroudyColors.innerLogoBg,
                                     width: double.infinity,
-                                    child: Image.network(
-                                      relChannel.logoUrl,
-                                      fit: BoxFit.contain,
-                                      errorBuilder: (_, _, _) => const Icon(Icons.tv, color: Colors.white),
-                                    ),
+                                    child: _ChannelLogo(url: relChannel.logoUrl),
                                   ),
                                 ),
                                 const SizedBox(height: 5),
@@ -1423,6 +1237,7 @@ class _MainDashboardState extends State<MainDashboard> {
           ),
         ),
       ],
+      ),
     );
   }
 }
@@ -1455,7 +1270,8 @@ class VideoCanvasPlayerLayer extends StatefulWidget {
   State<VideoCanvasPlayerLayer> createState() => _VideoCanvasPlayerLayerState();
 }
 
-class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
+class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
+    with WidgetsBindingObserver {
   late VlcPlayerController _controller;
 
   bool _showControls = true;
@@ -1475,7 +1291,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   static const Duration _bufferingWatchdog = Duration(seconds: 12);
 
   VlcVideoFit _currentFit = VlcVideoFit.fill;
-  String _selectedAspectRatio = 'Fit to screen';
+  String _selectedAspectRatio = _aspectFitToScreen;
   int? _selectedAudioTrackId;
   int? _selectedSubtitleTrackId;
 
@@ -1484,16 +1300,11 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   Timer? _controlsTimer;
 
-  // This notifier lets the fullscreen route immediately receive aspect-ratio
-  // changes made in the settings dialog.
-  late final ValueNotifier<VlcVideoFit> _fitNotifier;
-  late final ValueNotifier<String> _aspectNotifier;
-
   // Shared gesture state so the normal and fullscreen views stay in sync.
-  // Volume controls the real iOS device volume (0..100) via
-  // `flutter_volume_controller`. Brightness is applied through the
-  // `screen_brightness` plugin using the app-scoped setter, so it does not
-  // modify the system-wide brightness setting.
+  // Volume drives the real iOS device volume (0..100) via
+  // `flutter_volume_controller`. Brightness goes through `screen_brightness`;
+  // on iOS that writes a screen-wide setting, so it is restored whenever the app
+  // stops being visible — see didChangeAppLifecycleState.
   final ValueNotifier<int> _volumeNotifier = ValueNotifier<int>(100);
   final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
   StreamSubscription<double>? _volumeSubscription;
@@ -1501,12 +1312,45 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   @override
   void initState() {
     super.initState();
-    _fitNotifier = ValueNotifier<VlcVideoFit>(_currentFit);
-    _aspectNotifier = ValueNotifier<String>(_selectedAspectRatio);
+    WidgetsBinding.instance.addObserver(this);
     _createController(widget.streamUrl);
     _showControlsTemporarily();
     _syncInitialBrightness();
     _syncInitialVolume();
+    _restoreAspectRatio();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // A dimmed screen survives the app being force-quit or crashing, because iOS
+    // brightness is not scoped to one app. Hand the system value back as soon as
+    // the player stops being visible, and re-read it on return.
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      unawaited(
+        ScreenBrightness.instance
+            .resetApplicationScreenBrightness()
+            .catchError((Object e) => debugPrint('brightness restore on hide: $e')),
+      );
+    } else if (state == AppLifecycleState.resumed) {
+      _syncInitialBrightness();
+    }
+  }
+
+  /// The aspect ratio is a user preference, so it outlives the stream it was
+  /// chosen for. Audio and subtitle track ids are per-media and are not kept.
+  Future<void> _restoreAspectRatio() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_aspectRatioPrefKey);
+      if (saved == null || !mounted || saved == _selectedAspectRatio) return;
+      setState(() {
+        _selectedAspectRatio = saved;
+        _currentFit = fitForAspectRatio(saved);
+      });
+    } catch (e) {
+      debugPrint('Could not restore aspect ratio: $e');
+    }
   }
 
   void _syncInitialVolume() {
@@ -1530,20 +1374,36 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     // ValueKey(streamUrl), which recreated the State. Now that the parent
     // owns a stable GlobalKey across fullscreen transitions, we have to
     // detect the URL change ourselves and rebuild the controller in place.
-    if (oldWidget.streamUrl != widget.streamUrl) {
-      _controller.removeListener(_playerListener);
-      _controller.dispose();
-      _tracksLoaded = false;
-      _errorText = null;
-      _showBuffering = true;
-      _bufferingTimer?.cancel();
-      _selectedAudioTrackId = null;
-      _selectedSubtitleTrackId = null;
-      _audioTracks = [];
-      _subtitleTracks = [];
-      _createController(widget.streamUrl);
-      _showControlsTemporarily();
+    if (oldWidget.streamUrl == widget.streamUrl) return;
+    unawaited(_switchToStream(widget.streamUrl));
+  }
+
+  Future<void> _switchToStream(String url) async {
+    final outgoing = _controller;
+    outgoing.removeListener(_playerListener);
+
+    _tracksLoaded = false;
+    _audioTracks = [];
+    _subtitleTracks = [];
+    _selectedAudioTrackId = null;
+    _selectedSubtitleTrackId = null;
+    _errorText = null;
+    _bufferingTimer?.cancel();
+
+    // The replacement is created first so the widget tree always has a live
+    // controller to build against while the outgoing one winds down.
+    _createController(url);
+    _showControlsTemporarily();
+
+    // Then stop the old player before releasing it, matching shutdown(): VLC and
+    // the volume plugin share the single iOS AVAudioSession, and letting go of a
+    // still-running player can block the platform thread.
+    try {
+      await outgoing.stop();
+    } catch (e) {
+      debugPrint('switch stop: $e');
     }
+    outgoing.dispose();
   }
 
   Future<void> _syncInitialBrightness() async {
@@ -1572,11 +1432,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       autoPlay: true,
     );
     _controller.addListener(_playerListener);
+    // Assigned directly rather than through setState: both call sites run inside
+    // the frame that is about to rebuild this widget.
     _isPlaying = true;
     _userPaused = false;
     _showBuffering = true;
     _scheduleBufferingWatchdog();
-    _playingNotifier.value = true;
   }
 
   void _scheduleBufferingWatchdog() {
@@ -1622,17 +1483,20 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       setState(() {});
     }
 
-    if (value.errorMessage != null && value.errorMessage!.isNotEmpty) {
-      if (_errorText != value.errorMessage) {
-        setState(() => _errorText = value.errorMessage);
-      }
+    // Surface real VLC failures. The player used to read an `errorMessage`
+    // extension that always returned null, so a dead stream showed a black
+    // screen with no explanation.
+    final errorText = value.hasError
+        ? (value.errorDescription ?? value.error?.code ?? 'Playback failed')
+        : null;
+    if (errorText != _errorText) {
+      setState(() => _errorText = errorText);
     }
 
     // Do not call setState on every VLC update unless something actually
     // changed. Excess rebuilds can interfere with native player controls.
     if (_isPlaying != playing) {
       _isPlaying = playing;
-      _playingNotifier.value = playing;
       setState(() {});
     }
 
@@ -1640,9 +1504,13 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   bool _tracksLoaded = false;
+  bool _tracksLoadInFlight = false;
 
   Future<void> _loadTracksOnce() async {
-    if (_tracksLoaded) return;
+    // Guarded because the player listener fires on every VLC update: without it
+    // each event started another retry loop against the native track query.
+    if (_tracksLoaded || _tracksLoadInFlight || !mounted) return;
+    _tracksLoadInFlight = true;
 
     try {
       // Native VLC can expose tracks a little after playback starts. Retry a few
@@ -1669,6 +1537,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       }
     } catch (e) {
       debugPrint('Media tracks are not ready yet: $e');
+    } finally {
+      _tracksLoadInFlight = false;
     }
   }
 
@@ -1745,12 +1615,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     widget.onFullscreenChanged(!widget.isFullscreen);
   }
 
-  late final ValueNotifier<bool> _playingNotifier = ValueNotifier<bool>(false);
-
-  void _syncPlayingNotifier() {
-    _playingNotifier.value = _isPlaying;
-  }
-
   Future<void> _openPlayerSettingsDialog() async {
     await _loadTracksOnce();
     if (!mounted) return;
@@ -1785,7 +1649,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
                   _buildDropdownRow(
                     label: 'Aspect Ratio:',
                     value: tempAspect,
-                    items: const ['Fit to screen', '16:9', '4:3'],
+                    items: const [_aspectFitToScreen, _aspect16x9, _aspect4x3],
                     onChanged: (val) => setDialogState(() => tempAspect = val!),
                   ),
                   const SizedBox(height: 12),
@@ -1907,15 +1771,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
   }
 
   Future<void> _applySettings(String aspect, int? audioId, int? subtitleId) async {
-    VlcVideoFit newFit;
-
-    // "Fit to screen" intentionally stretches the stream to the complete
-    // available player rectangle in both normal and fullscreen modes.
-    // 16:9 and 4:3 use `cover` so the stream fills the selected rectangle
-    // and any overflow is cropped, rather than letterboxing inside it.
-    newFit = aspect == 'Fit to screen'
-        ? VlcVideoFit.fill
-        : VlcVideoFit.cover;
+    final newFit = fitForAspectRatio(aspect);
 
     if (mounted) {
       setState(() {
@@ -1925,8 +1781,16 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         _currentFit = newFit;
       });
     }
-    _fitNotifier.value = newFit;
-    _aspectNotifier.value = aspect;
+
+    // The button offers to save, so the preference has to survive the next
+    // channel switch. Track ids are media-specific and are deliberately not
+    // persisted.
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_aspectRatioPrefKey, aspect);
+    } catch (e) {
+      debugPrint('Could not save aspect ratio: $e');
+    }
 
     try {
       // Apply the selected audio track. null means leave the current track alone.
@@ -1985,6 +1849,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _controlsTimer?.cancel();
     _bufferingTimer?.cancel();
     if (!_shutDown) {
@@ -2001,9 +1866,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
         (Object e) => debugPrint('resetApplicationScreenBrightness: $e'),
       );
     }
-    _fitNotifier.dispose();
-    _aspectNotifier.dispose();
-    _playingNotifier.dispose();
     _volumeNotifier.dispose();
     _brightnessNotifier.dispose();
     _controller.removeListener(_playerListener);
@@ -2019,14 +1881,14 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
     );
 
     switch (_selectedAspectRatio) {
-      case '16:9':
+      case _aspect16x9:
         return Center(
           child: AspectRatio(
             aspectRatio: 16 / 9,
             child: ClipRect(child: player),
           ),
         );
-      case '4:3':
+      case _aspect4x3:
         return Center(
           child: AspectRatio(
             aspectRatio: 4 / 3,
@@ -2040,8 +1902,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
   @override
   Widget build(BuildContext context) {
-    _syncPlayingNotifier();
-
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -2068,16 +1928,38 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
 
         if (_errorText != null)
           Positioned.fill(
-            child: IgnorePointer(
-              child: Container(
-                color: Colors.black54,
-                alignment: Alignment.center,
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  'VLC playback error:\n$_errorText',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white),
-                ),
+            child: Container(
+              color: Colors.black.withAlpha(200),
+              alignment: Alignment.center,
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, color: ShroudyColors.primaryRed, size: 40),
+                  const SizedBox(height: 12),
+                  Text(
+                    'This channel stopped responding.\n$_errorText',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  const SizedBox(height: 18),
+                  OutlinedButton.icon(
+                    onPressed: () => unawaited(_switchToStream(widget.streamUrl)),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: ShroudyColors.accentBorder, width: 1.5),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(22),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 12),
+                    ),
+                    icon: const Icon(Icons.refresh, color: Colors.white),
+                    label: const Text(
+                      'Retry',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -2223,10 +2105,6 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer> {
       ),
     );
   }
-}
-
-extension on VlcPlayerValue {
-  String? get errorMessage => null;
 }
 
 enum _GestureSide { volume, brightness }
@@ -2429,7 +2307,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
                 child: _activeSide == _GestureSide.volume
                     ? ValueListenableBuilder<int>(
                         valueListenable: widget.volumeNotifier,
-                        builder: (_, v, __) => _indicatorBody(
+                        builder: (_, v, _) => _indicatorBody(
                           icon: v == 0
                               ? Icons.volume_off
                               : (v < 50 ? Icons.volume_down : Icons.volume_up),
@@ -2439,7 +2317,7 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
                       )
                     : ValueListenableBuilder<double>(
                         valueListenable: widget.brightnessNotifier,
-                        builder: (_, b, __) => _indicatorBody(
+                        builder: (_, b, _) => _indicatorBody(
                           icon: Icons.brightness_6,
                           fraction: ((b - _minBrightness) /
                                   (1.0 - _minBrightness))
@@ -2512,7 +2390,446 @@ class _VideoGestureLayerState extends State<_VideoGestureLayer> {
   }
 }
 
-class BorderBorder extends Border {
-  const BorderBorder({required BorderSide side, double width = 1.0})
-      : super(top: side, bottom: side, left: side, right: side);
+// -----------------------------------------------------------------------------
+// EPG fetching and matching.
+//
+// Everything in this section runs inside `compute()`, i.e. on a background
+// isolate. That imposes two rules: the types passed in and out must be plain
+// data (no closures, no widget or platform-view references), and the helpers
+// must be top-level functions rather than `State` methods.
+// -----------------------------------------------------------------------------
+
+class _EpgChannelQuery {
+  final String name;
+  final String tvgId;
+
+  const _EpgChannelQuery({required this.name, required this.tvgId});
+
+  String get key => tvgId.trim().isNotEmpty ? tvgId.trim() : name;
+}
+
+class _EpgRequest {
+  final List<String> urls;
+  final List<_EpgChannelQuery> channels;
+
+  const _EpgRequest({required this.urls, required this.channels});
+}
+
+class _EpgResult {
+  final Map<String, EpgData> byChannel;
+  final Set<String> exhaustedKeys;
+
+  const _EpgResult({required this.byChannel, required this.exhaustedKeys});
+}
+
+/// Download every guide, parse it, and merge whatever matches the playlist.
+Future<_EpgResult> _runEpgSweep(_EpgRequest request) async {
+  final merged = <String, EpgData>{};
+  final matchedThisSweep = <String>{};
+
+  for (final url in request.urls) {
+    try {
+      final response = await http
+          .get(Uri.parse(url))
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        debugPrint('EPG source HTTP ${response.statusCode}: $url');
+        continue;
+      }
+
+      final xml = _decodeGuide(response.bodyBytes);
+      final programmes = _parseGuideProgrammes(xml);
+      final byName = _indexGuideByName(xml, programmes);
+
+      for (final channel in request.channels) {
+        final matched =
+            _matchChannelProgrammes(channel, programmes, byName);
+        if (matched == null || matched.isEmpty) continue;
+
+        final data = buildEpgData(matched);
+        if (!hasUsefulEpgData(data)) continue;
+
+        matchedThisSweep.add(channel.key);
+        final previous = merged[channel.key];
+        merged[channel.key] = previous == null ? data : mergeEpgData(previous, data);
+      }
+
+      debugPrint(
+        'EPG source parsed: ${programmes.length} XMLTV IDs, '
+        '${merged.length} matched channels from $url',
+      );
+
+      // Release the parsed guide before the next source is decoded, so the
+      // isolate holds one multi-megabyte tree at a time rather than all of them.
+      programmes.clear();
+      byName.clear();
+    } catch (e) {
+      debugPrint('EPG source failed $url: $e');
+    }
+  }
+
+  final exhausted = <String>{
+    for (final channel in request.channels)
+      if (!matchedThisSweep.contains(channel.key)) channel.key,
+  };
+
+  return _EpgResult(byChannel: merged, exhaustedKeys: exhausted);
+}
+
+/// Guides are served gzipped, but a mirror can fall back to plain XML.
+String _decodeGuide(List<int> bytes) {
+  if (bytes.length >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b) {
+    return utf8.decode(gzip.decode(bytes), allowMalformed: true);
+  }
+  return utf8.decode(bytes, allowMalformed: true);
+}
+
+Map<String, List<EpgProgram>> _parseGuideProgrammes(String xml) {
+  final programmes = <String, List<EpgProgram>>{};
+
+  // Match programme elements regardless of attribute ordering and support both
+  // single- and double-quoted XML attributes.
+  final programmeRegex = RegExp(
+    r'''<programme\b([^>]*)>(.*?)</programme\s*>''',
+    caseSensitive: false,
+    dotAll: true,
+  );
+
+  for (final m in programmeRegex.allMatches(xml)) {
+    final attrs = m.group(1)!;
+    final body = m.group(2)!;
+
+    final channelId = _attrValue(_channelIdAttr, attrs);
+    final startRaw = _attrValue(_startAttr, attrs);
+    final stopRaw = _attrValue(_stopAttr, attrs);
+
+    if (channelId == null || channelId.isEmpty || startRaw == null || stopRaw == null) {
+      continue;
+    }
+
+    final start = parseXmltvDate(startRaw);
+    final stop = parseXmltvDate(stopRaw);
+    if (start == null || stop == null || !stop.isAfter(start)) continue;
+
+    // Prefer the English XMLTV title when the provider supplies one; otherwise
+    // retain the provider's first title.
+    final title = englishXmlText(body, 'title');
+    if (title.isEmpty || _isPlaceholderTitle(title)) continue;
+
+    (programmes[channelId] ??= []).add(
+      EpgProgram(
+        start: start,
+        stop: stop,
+        title: title,
+        description: _usableDescription(englishXmlText(body, 'desc')),
+        imageUrl: xmlIconUrl(body),
+      ),
+    );
+  }
+
+  return programmes;
+}
+
+/// Some guides fill unfilled slots with a placeholder entry instead of omitting
+/// it. iptv-epg.org alone publishes thousands of `<title>No Data</title>`
+/// blocks, and because that source is merged last it overwrites the real titles
+/// already collected from other providers.
+bool _isPlaceholderTitle(String title) {
+  const placeholders = {
+    '', 'nodata', 'noinfo', 'noinformation', 'unknown', 'na', 'none', 'tbd',
+    'notavailable', 'programme', 'epg',
+  };
+  final normalised = title
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]'), '');
+  return placeholders.contains(normalised);
+}
+
+/// Placeholder descriptions are a bare link back to the provider's help page.
+String _usableDescription(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) return '';
+  if (trimmed.startsWith('http') && !trimmed.contains(' ')) return '';
+  if (_isPlaceholderTitle(trimmed)) return '';
+  return trimmed;
+}
+
+/// Normalised display-name index, because most playlist entries carry no
+/// `tvg-id` that matches the guide's channel ids.
+Map<String, List<EpgProgram>> _indexGuideByName(
+  String xml,
+  Map<String, List<EpgProgram>> programmes,
+) {
+  final channelRegex = RegExp(
+    r'''<channel\b[^>]*\bid\s*=\s*(["'])(.*?)\1[^>]*>(.*?)</channel\s*>''',
+    caseSensitive: false,
+    dotAll: true,
+  );
+  final displayRegex = RegExp(
+    r'''<display-name\b[^>]*>(.*?)</display-name\s*>''',
+    caseSensitive: false,
+    dotAll: true,
+  );
+
+  final byName = <String, List<EpgProgram>>{};
+
+  for (final m in channelRegex.allMatches(xml)) {
+    final id = (m.group(2) ?? '').trim();
+    final body = m.group(3) ?? '';
+    if (id.isEmpty || !programmes.containsKey(id)) continue;
+
+    final dm = displayRegex.firstMatch(body);
+    if (dm == null) continue;
+
+    final display = decodeXmlText(_stripTags(dm.group(1) ?? ''));
+    final key = epgNameKey(display);
+    if (key.isNotEmpty) {
+      (byName[key] ??= <EpgProgram>[]).addAll(programmes[id]!);
+    }
+  }
+
+  return byName;
+}
+
+List<EpgProgram>? _matchChannelProgrammes(
+  _EpgChannelQuery channel,
+  Map<String, List<EpgProgram>> programmes,
+  Map<String, List<EpgProgram>> byName,
+) {
+  List<EpgProgram>? matched;
+
+  // 1. Exact tvg-id match, then a case-insensitive retry.
+  final id = channel.tvgId.trim();
+  if (id.isNotEmpty) {
+    matched = programmes[id];
+    if (matched == null) {
+      for (final entry in programmes.entries) {
+        if (entry.key.toLowerCase() == id.toLowerCase()) {
+          matched = entry.value;
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Exact normalised channel-name match.
+  final channelKey = epgNameKey(channel.name);
+  matched ??= byName[channelKey];
+
+  // 3. Fuzzy normalised-name match for provider naming differences.
+  if (matched == null && channelKey.isNotEmpty) {
+    int bestScore = 0;
+    for (final entry in byName.entries) {
+      final epgKey = entry.key;
+      int score;
+
+      if (epgKey == channelKey) {
+        score = 100;
+      } else if (epgKey.contains(channelKey) || channelKey.contains(epgKey)) {
+        score = 80;
+      } else {
+        final overlap =
+            epgTokens(channelKey).intersection(epgTokens(epgKey)).length;
+        score = overlap >= 2 ? 50 + overlap : 0;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        matched = entry.value;
+      }
+    }
+  }
+
+  return matched;
+}
+
+EpgData buildEpgData(List<EpgProgram> source) {
+  if (source.isEmpty) return const EpgData();
+
+  final sorted = List<EpgProgram>.from(source)
+    ..sort((a, b) => a.start.compareTo(b.start));
+
+  final now = DateTime.now();
+  EpgProgram? current;
+  final future = <EpgProgram>[];
+
+  for (final program in sorted) {
+    if (!program.start.isAfter(now) && program.stop.isAfter(now)) {
+      current ??= program;
+    } else if (program.start.isAfter(now)) {
+      future.add(program);
+    }
+  }
+
+  return EpgData(
+    now: current,
+    next: future.isNotEmpty ? future.first : null,
+    upcoming: future.take(6).toList(),
+  );
+}
+
+bool hasUsefulEpgData(EpgData data) =>
+    data.now != null || data.next != null || data.upcoming.isNotEmpty;
+
+EpgProgram? mergeEpgProgram(EpgProgram? preferred, EpgProgram? fallback) {
+  if (preferred == null) return fallback;
+  if (fallback == null) return preferred;
+  return EpgProgram(
+    start: preferred.start,
+    stop: preferred.stop,
+    title: preferred.title,
+    description: preferred.description.isNotEmpty
+        ? preferred.description
+        : fallback.description,
+    imageUrl: preferred.imageUrl?.isNotEmpty == true
+        ? preferred.imageUrl
+        : fallback.imageUrl,
+  );
+}
+
+EpgData mergeEpgData(EpgData oldData, EpgData newData) {
+  final allUpcoming = <String, EpgProgram>{
+    for (final p in [...oldData.upcoming, ...newData.upcoming])
+      '${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}': p,
+  };
+
+  final upcoming = allUpcoming.values.toList()
+    ..sort((a, b) => a.start.compareTo(b.start));
+
+  return EpgData(
+    now: mergeEpgProgram(newData.now, oldData.now),
+    next: mergeEpgProgram(newData.next, oldData.next),
+    upcoming: upcoming.take(6).toList(),
+  );
+}
+
+/// Normalises provider/channel naming differences so the same channel still
+/// matches when the M3U and XMLTV labels disagree.
+String epgNameKey(String value) {
+  var v = value.toLowerCase().trim().replaceAll('&amp;', '&');
+  v = v.replaceAll(RegExp(r'\bsony entertainment television\b'), 'set');
+  v = v.replaceAll(RegExp(r'\bsony hd\b'), 'set hd');
+  v = v.replaceAll(RegExp(r'\bfull hd\b'), ' ');
+  v = v.replaceAll(RegExp(r'\bhigh definition\b'), ' ');
+  v = v.replaceAll(RegExp(r'\b(\d+\s*)?(hd|sd)\b'), ' ');
+  v = v.replaceAll(RegExp(r'\b(india|indian|tv channel|channel)\b'), ' ');
+  v = v.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
+}
+
+Set<String> epgTokens(String value) {
+  const ignored = {
+    'tv', 'television', 'channel', 'india', 'hd', 'sd',
+    'english', 'hindi', 'live', 'network',
+  };
+
+  return value
+      .split(RegExp(r'[^a-z0-9]+'))
+      .where((e) => e.length >= 2 && !ignored.contains(e))
+      .toSet();
+}
+
+DateTime? parseXmltvDate(String? raw) {
+  if (raw == null) return null;
+  final value = raw.trim();
+  try {
+    return DateTime.parse(value).toLocal();
+  } catch (_) {}
+
+  // XMLTV commonly uses: yyyyMMddHHmmss +0000 / yyyyMMddHHmmss -0500
+  final match = RegExp(
+    r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?$',
+  ).firstMatch(value);
+  if (match == null) return null;
+
+  final year = int.parse(match.group(1)!);
+  final month = int.parse(match.group(2)!);
+  final day = int.parse(match.group(3)!);
+  final hour = int.parse(match.group(4)!);
+  final minute = int.parse(match.group(5)!);
+  final second = int.parse(match.group(6)!);
+  final sign = match.group(7);
+
+  if (sign == null) {
+    return DateTime(year, month, day, hour, minute, second);
+  }
+
+  final offset = Duration(
+    hours: int.tryParse(match.group(8) ?? '0') ?? 0,
+    minutes: int.tryParse(match.group(9) ?? '0') ?? 0,
+  );
+  final utc = DateTime.utc(year, month, day, hour, minute, second);
+  return (sign == '+') ? utc.subtract(offset).toLocal() : utc.add(offset).toLocal();
+}
+
+String decodeXmlText(String value) {
+  return value
+      .replaceAll('&amp;', '&')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&apos;', "'")
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAllMapped(
+        RegExp(r'&#(\d+);'),
+        (m) => String.fromCharCode(int.tryParse(m.group(1)!) ?? 32),
+      );
+}
+
+String _stripTags(String value) => value.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+
+String _cleanEpgText(String value) => decodeXmlText(_stripTags(value));
+
+/// Returns the English text of [tag] when the provider marks one up, otherwise
+/// the first non-empty value.
+String englishXmlText(String body, String tag) {
+  final matches = RegExp(
+    '<$tag\\b([^>]*)>(.*?)</$tag\\s*>',
+    caseSensitive: false,
+    dotAll: true,
+  ).allMatches(body);
+
+  String? firstText;
+  for (final match in matches) {
+    final attrs = match.group(1) ?? '';
+    final text = _cleanEpgText(match.group(2) ?? '');
+    if (text.isEmpty) continue;
+    firstText ??= text;
+
+    final lang = (_attrValue(_langAttr, attrs) ?? '').toLowerCase();
+    if (lang == 'en' ||
+        lang.startsWith('en-') ||
+        lang.startsWith('en_') ||
+        lang == 'eng' ||
+        lang == 'english') {
+      return text;
+    }
+  }
+  return firstText ?? '';
+}
+
+String? xmlIconUrl(String body) {
+  final match = RegExp(
+    r'''<icon\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1''',
+    caseSensitive: false,
+  ).firstMatch(body);
+  final value = (match?.group(2) ?? '').trim();
+  return value.isEmpty ? null : decodeXmlText(value);
+}
+
+// Pre-compiled attribute patterns: the 65 MB guides contain tens of thousands
+// of elements, so building these per element would dominate the parse time.
+RegExp _attrPattern(String name) =>
+    RegExp('''\\b$name\\s*=\\s*(?:"([^"]*)"|'([^']*)')''');
+
+final RegExp _channelIdAttr = _attrPattern('channel');
+final RegExp _startAttr = _attrPattern('start');
+final RegExp _stopAttr = _attrPattern('stop');
+final RegExp _langAttr = _attrPattern('lang');
+
+String? _attrValue(RegExp pattern, String text) {
+  final m = pattern.firstMatch(text);
+  if (m == null) return null;
+  return (m.group(1) ?? m.group(2) ?? '').trim();
 }

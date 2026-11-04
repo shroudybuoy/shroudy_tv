@@ -18,12 +18,12 @@ dependencies:
   shared_preferences: ^2.3.2
   cupertino_icons: ^1.0.8
 
-  # App-scoped screen brightness for the left-side vertical drag gesture.
-  # On iOS this maps to UIScreen.brightness; on Android it uses the
-  # window's screenBrightness attribute. No Info.plist permission needed.
+  # Screen brightness for the left-side vertical drag gesture.
+  # On Android this uses the window's screenBrightness attribute, so it only
+  # affects this app. On iOS it sets UIScreen.brightness, which is system-wide:
+  # the app must reset it when it goes to the background. No Info.plist
+  # permission is needed for either platform.
   screen_brightness: ^2.1.3
-  screen_brightness_android: ^2.1.3
-  screen_brightness_ios: ^2.1.3
 
   # Real device (system) volume control for the right-side vertical drag
   # gesture. On iOS this drives the hardware volume via MPVolumeView so the

@@ -13,33 +13,14 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-
-      - name: Overwrite Older SDK Constraints
-        run: |
-          sed -i '' 's/sdk: ">=3.13.4 <4.0.0"/sdk: ">=3.22.0 <4.0.0"/g' pubspec.yaml || true
-
-      - name: Re-create Native iOS Layout Configuration Targets
-        run: flutter create . --platforms=ios
-
-      - name: Inject Apple Transport Networking Exceptions
-        run: |
-          # Automatically injects network bypass permissions directly into Info.plist
-          PLIST_PATH="ios/Runner/Info.plist"
-          sed -i '' '/<dict>/a\
-          <key>NSAppTransportSecurity</key>\
-          <dict>\
-              <key>NSAllowsArbitraryLoads</key>\
-              <true/>\
-          </dict>' "$PLIST_PATH"
-
-      - name: Patch Hidden iOS Code-Signing Profile Rules
-        run: |
-          # Automatically strips out strict development team constraints so it compiles cleanly on cloud machines
-          sed -i '' 's/DEVELOPMENT_TEAM = "";/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
-          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO;/g' ios/Runner.xcodeproj/project.pbxproj || true
+          flutter-version: '3.47.5'
+          cache: true
 
       - name: Fetch system dependencies
         run: flutter pub get
+
+      - name: Static analysis
+        run: flutter analyze
 
       - name: Compile Lightweight iPad Application Asset Container
         run: flutter build ios --release --no-codesign
