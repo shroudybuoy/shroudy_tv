@@ -11,6 +11,8 @@ import 'package:screen_brightness/screen_brightness.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vlc_player/vlc_player.dart';
 
+import 'picture_in_picture.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // Keep channel logos in memory for the whole app session so each one is
@@ -292,9 +294,17 @@ class _MainDashboardState extends State<MainDashboard> {
   String _searchQuery = '';
   ChannelItem? _currentChannel;
   bool _isLoading = true;
-  final Map<String, EpgData> _epgByChannel = {};
+  final Map<String, List<EpgProgram>> _epgByChannel = {};
   Timer? _epgRefreshTimer;
   String? _playlistEpgUrl;
+
+  // Ticks while the guide is on screen so "LIVE NOW" rolls over to the next
+  // programme as soon as it starts, instead of waiting for the next data sweep.
+  final ValueNotifier<DateTime> _epgClock = ValueNotifier<DateTime>(
+    DateTime.now(),
+  );
+  Timer? _epgClockTimer;
+  static const Duration _epgClockInterval = Duration(seconds: 30);
 
   // Playlist loading state. A failed or slow fetch used to leave the app on
   // the splash screen forever, so the request is now bounded by a timeout and
@@ -313,7 +323,7 @@ class _MainDashboardState extends State<MainDashboard> {
   final DateTime _bootStart = DateTime.now();
   static const Duration _minBootDuration = Duration(milliseconds: 2200);
 
-  // How long the on-screen boot animation is held for.
+  // How often a fresh guide sweep is pulled in the background.
   static const Duration _epgRefreshInterval = Duration(minutes: 15);
 
   // Fullscreen state is owned HERE (not inside VideoCanvasPlayerLayer) so
@@ -329,6 +339,10 @@ class _MainDashboardState extends State<MainDashboard> {
     super.initState();
     _fetchM3uPlaylist();
     _epgRefreshTimer = Timer.periodic(_epgRefreshInterval, (_) => _fetchEpg());
+    _epgClockTimer = Timer.periodic(
+      _epgClockInterval,
+      (_) => _epgClock.value = DateTime.now(),
+    );
   }
 
   // Waits out the remaining minimum boot time (if any), then reveals the UI.
@@ -498,7 +512,12 @@ class _MainDashboardState extends State<MainDashboard> {
           .timeout(const Duration(minutes: 3));
       if (!mounted) return;
       setState(() {
-        _epgByChannel.addAll(result.byChannel);
+        result.byChannel.forEach((key, programmes) {
+          final existing = _epgByChannel[key];
+          _epgByChannel[key] = existing == null
+              ? programmes
+              : mergeEpgProgrammes(existing, programmes);
+        });
         // Channels no source could match are retired for the session instead of
         // being re-attempted by every later sweep.
         _epgExhaustedKeys.addAll(result.exhaustedKeys);
@@ -518,6 +537,8 @@ class _MainDashboardState extends State<MainDashboard> {
   @override
   void dispose() {
     _epgRefreshTimer?.cancel();
+    _epgClockTimer?.cancel();
+    _epgClock.dispose();
     super.dispose();
   }
 
@@ -816,7 +837,7 @@ class _MainDashboardState extends State<MainDashboard> {
     );
   }
   Widget _buildEpgPanel(ChannelItem channel) {
-    final data = _epgByChannel[epgKeyFor(channel)];
+    final programmes = _epgByChannel[epgKeyFor(channel)];
 
     return SingleChildScrollView(
       child: Column(
@@ -878,60 +899,76 @@ class _MainDashboardState extends State<MainDashboard> {
           ),
           const SizedBox(height: 12),
 
-          if (data?.now != null)
-            _buildLiveNowCard(data!.now!, channel.logoUrl)
-          else
-            const Text(
-              'No LIVE NOW programme found.',
-              style: TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-
-          const SizedBox(height: 16),
-
-          if (data?.next != null) ...[
-            const Text(
-              'NEXT',
-              style: TextStyle(
-                color: Colors.orangeAccent,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 6),
-            _buildEpgProgrammeRow(data!.next!, channel.logoUrl),
-          ],
-
-          const SizedBox(height: 18),
-
-          if (data?.upcoming.isNotEmpty == true) ...[
-            const Text(
-              'UPCOMING',
-              style: TextStyle(
-                color: Colors.lightBlueAccent,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            ...data!.upcoming.skip(1).take(5).map(
-              (program) => _buildEpgProgrammeRow(program, channel.logoUrl),
-            ),
-          ] else if (data != null) ...[
-            const Text(
-              'No additional upcoming programmes found.',
-              style: TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-          ],
-
-          if (data == null) ...[
-            const SizedBox(height: 10),
-            const Text(
-              'EPG is loading or this channel could not be matched.',
-              style: TextStyle(color: Colors.grey, fontSize: 12),
-            ),
-          ],
+          ValueListenableBuilder<DateTime>(
+            valueListenable: _epgClock,
+            builder: (_, _, _) =>
+                _buildEpgRows(programmes, channel.logoUrl),
+          ),
         ],
       ),
+    );
+  }
+
+  /// Resolved on every paint rather than at sweep time: a guide pulled fifteen
+  /// minutes ago still has to show the programme that is on air right now.
+  Widget _buildEpgRows(List<EpgProgram>? programmes, String channelLogoUrl) {
+    if (programmes == null || programmes.isEmpty) {
+      return const Text(
+        'EPG is loading or this channel could not be matched.',
+        style: TextStyle(color: Colors.grey, fontSize: 12),
+      );
+    }
+
+    final data = buildEpgData(programmes);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (data.now != null)
+          _buildLiveNowCard(data.now!, channelLogoUrl)
+        else
+          const Text(
+            'No LIVE NOW programme found.',
+            style: TextStyle(color: Colors.grey, fontSize: 12),
+          ),
+
+        const SizedBox(height: 16),
+
+        if (data.next != null) ...[
+          const Text(
+            'NEXT',
+            style: TextStyle(
+              color: Colors.orangeAccent,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 6),
+          _buildEpgProgrammeRow(data.next!, channelLogoUrl),
+        ],
+
+        const SizedBox(height: 18),
+
+        if (data.upcoming.isNotEmpty) ...[
+          const Text(
+            'UPCOMING',
+            style: TextStyle(
+              color: Colors.lightBlueAccent,
+              fontSize: 11,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ...data.upcoming.skip(1).take(5).map(
+            (program) => _buildEpgProgrammeRow(program, channelLogoUrl),
+          ),
+        ] else ...[
+          const Text(
+            'No additional upcoming programmes found.',
+            style: TextStyle(color: Colors.grey, fontSize: 12),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1309,6 +1346,12 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
   final ValueNotifier<double> _brightnessNotifier = ValueNotifier<double>(1.0);
   StreamSubscription<double>? _volumeSubscription;
 
+  // Picture in Picture. iOS shows a second, silent AVPlayer copy of the current
+  // stream when the app is backgrounded; VLC has to go quiet for the duration or
+  // the user hears the same soundtrack twice.
+  StreamSubscription<PipStatus>? _pipSubscription;
+  bool _pipActive = false;
+
   @override
   void initState() {
     super.initState();
@@ -1318,6 +1361,48 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
     _syncInitialBrightness();
     _syncInitialVolume();
     _restoreAspectRatio();
+    _armPictureInPicture(widget.streamUrl);
+  }
+
+  void _armPictureInPicture(String url) {
+    if (!PictureInPicture.isSupported) return;
+    _pipSubscription ??= PictureInPicture.statuses.listen(_onPipStatus);
+    unawaited(PictureInPicture.arm(url));
+  }
+
+  void _onPipStatus(PipStatus status) {
+    if (status.failed && status.url == widget.streamUrl) {
+      // AVPlayer cannot open this stream, so the channel simply gets no PiP.
+      debugPrint('PiP unavailable for ${status.url}: ${status.error}');
+    }
+    if (status.active == _pipActive) return;
+    _pipActive = status.active;
+    // Leaving the app hands the audio to the PiP copy; coming back hands it back.
+    unawaited(_pipActive ? _silenceVlcForPiP() : _resumeVlcAfterPiP());
+  }
+
+  Future<void> _silenceVlcForPiP() async {
+    try {
+      await _controller.pause();
+      // Live IPTV inputs often ignore pause(), which would leave two soundtracks
+      // playing, so fall back to stop() the same way the pause button does.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (!mounted || !_pipActive) return;
+      if (!_isPausedState(_controller.value.state)) {
+        await _controller.stop();
+      }
+    } catch (e) {
+      debugPrint('PiP VLC pause: $e');
+    }
+  }
+
+  Future<void> _resumeVlcAfterPiP() async {
+    if (_userPaused || !mounted) return;
+    try {
+      await _controller.play();
+    } catch (e) {
+      debugPrint('PiP VLC resume: $e');
+    }
   }
 
   @override
@@ -1394,6 +1479,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
     // controller to build against while the outgoing one winds down.
     _createController(url);
     _showControlsTemporarily();
+    _armPictureInPicture(url);
 
     // Then stop the old player before releasing it, matching shutdown(): VLC and
     // the volume plugin share the single iOS AVAudioSession, and letting go of a
@@ -1832,6 +1918,9 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
     } catch (e) {
       debugPrint('shutdown stop: $e');
     }
+    _pipSubscription?.cancel();
+    _pipSubscription = null;
+    await PictureInPicture.disarm();
     await _volumeSubscription?.cancel();
     _volumeSubscription = null;
     FlutterVolumeController.removeListener();
@@ -1852,6 +1941,8 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
     WidgetsBinding.instance.removeObserver(this);
     _controlsTimer?.cancel();
     _bufferingTimer?.cancel();
+    _pipSubscription?.cancel();
+    _pipSubscription = null;
     if (!_shutDown) {
       // Fallback for the rare path where the widget is removed without an
       // awaited shutdown(). Stop VLC before touching the shared audio session
@@ -1859,6 +1950,7 @@ class _VideoCanvasPlayerLayerState extends State<VideoCanvasPlayerLayer>
       unawaited(_controller.stop().catchError(
         (Object e) => debugPrint('dispose stop: $e'),
       ));
+      unawaited(PictureInPicture.disarm());
       _volumeSubscription?.cancel();
       FlutterVolumeController.removeListener();
       FlutterVolumeController.updateShowSystemUI(true);
@@ -2416,7 +2508,11 @@ class _EpgRequest {
 }
 
 class _EpgResult {
-  final Map<String, EpgData> byChannel;
+  /// Raw programme windows, NOT a resolved now/next view: the guide is swept
+  /// every fifteen minutes, so anything computed against the clock inside the
+  /// isolate would be stale the moment a programme rolls over. The UI resolves
+  /// these against the current time each time it paints.
+  final Map<String, List<EpgProgram>> byChannel;
   final Set<String> exhaustedKeys;
 
   const _EpgResult({required this.byChannel, required this.exhaustedKeys});
@@ -2424,8 +2520,11 @@ class _EpgResult {
 
 /// Download every guide, parse it, and merge whatever matches the playlist.
 Future<_EpgResult> _runEpgSweep(_EpgRequest request) async {
-  final merged = <String, EpgData>{};
+  final merged = <String, List<EpgProgram>>{};
   final matchedThisSweep = <String>{};
+  final profiles = [
+    for (final channel in request.channels) _ChannelProfile.of(channel.name),
+  ];
 
   for (final url in request.urls) {
     try {
@@ -2440,19 +2539,27 @@ Future<_EpgResult> _runEpgSweep(_EpgRequest request) async {
 
       final xml = _decodeGuide(response.bodyBytes);
       final programmes = _parseGuideProgrammes(xml);
-      final byName = _indexGuideByName(xml, programmes);
+      final entries = _indexGuideChannels(xml, programmes);
 
-      for (final channel in request.channels) {
-        final matched =
-            _matchChannelProgrammes(channel, programmes, byName);
-        if (matched == null || matched.isEmpty) continue;
+      for (var i = 0; i < request.channels.length; i++) {
+        final channel = request.channels[i];
+        final entry = _matchGuideChannel(channel, profiles[i], entries);
+        if (entry == null) continue;
 
-        final data = buildEpgData(matched);
-        if (!hasUsefulEpgData(data)) continue;
+        final matched = entry.programmes;
+        if (matched.isEmpty) continue;
+
+        // Programmes that finished more than half a day ago can never become
+        // "LIVE NOW" again; dropping them keeps each channel list bounded as
+        // sweeps accumulate.
+        final cutoff = DateTime.now().subtract(const Duration(hours: 12));
+        final fresh = matched.where((p) => p.stop.isAfter(cutoff)).toList();
+        if (fresh.isEmpty) continue;
 
         matchedThisSweep.add(channel.key);
         final previous = merged[channel.key];
-        merged[channel.key] = previous == null ? data : mergeEpgData(previous, data);
+        merged[channel.key] =
+            previous == null ? fresh : mergeEpgProgrammes(previous, fresh);
       }
 
       debugPrint(
@@ -2463,7 +2570,7 @@ Future<_EpgResult> _runEpgSweep(_EpgRequest request) async {
       // Release the parsed guide before the next source is decoded, so the
       // isolate holds one multi-megabyte tree at a time rather than all of them.
       programmes.clear();
-      byName.clear();
+      entries.clear();
     } catch (e) {
       debugPrint('EPG source failed $url: $e');
     }
@@ -2555,9 +2662,133 @@ String _usableDescription(String value) {
   return trimmed;
 }
 
-/// Normalised display-name index, because most playlist entries carry no
-/// `tvg-id` that matches the guide's channel ids.
-Map<String, List<EpgProgram>> _indexGuideByName(
+/// Words that do not identify a distinct channel. Two feeds that differ only
+/// by these are the same channel.
+///
+/// Deliberately narrow: "live", "india" and "24x7" are NOT here because they
+/// do separate channels (MTV Live is not MTV, NDTV India is not NDTV 24x7), and
+/// a loose noise list is what let "Zee TV" match a guide entry called India TV.
+const Set<String> _epgNoiseTokens = {
+  'hd', 'sd', 'fhd', 'fullhd', 'hdr', '4k', 'uhd', 'full', 'high',
+  'definition', 'tv', 'television', 'channel', 'timeshift', 'official',
+  'stream', 'feed',
+};
+
+/// Words that DO separate channels. Indian packages run the same brand in many
+/// languages, so "Star Sports 1 Hindi" and "Star Sports 1 Tamil" are different
+/// channels and must never borrow each other's schedule.
+const Set<String> _epgLanguageTokens = {
+  'hindi', 'tamil', 'telugu', 'kannada', 'malayalam', 'bengali', 'marathi',
+  'gujarati', 'punjabi', 'urdu', 'odia', 'oriya', 'assamese', 'english',
+  'bhojpuri', 'haryanvi', 'devgeeti', 'konkani', 'manipuri', 'bodo',
+  'maithili', 'sanskrit', 'tulu', 'rajasthani', 'nepali',
+};
+
+/// SEO words that guides bolt onto the end of a real channel name. epgshare01's
+/// IN2 list is the worst offender: its 54 channels are named "Sony Max Tv
+/// Channel Today", "Big Magic Of Friday" and "Goldmines Movies Today For Dd
+/// Free Dish Users". Those extras say nothing about which channel the schedule
+/// belongs to, but they are enough to break the exact-comparison tiers above,
+/// which is why they are ignored only at the lowest-confidence tier.
+const Set<String> _epgGuideFillerTokens = {
+  'today', 'todays', 'yesterday', 'tomorrow', 'latest', 'now', 'list',
+  'checkout', 'schedule', 'schedules', 'timing', 'timings', 'watch', 'online',
+  'free', 'dish', 'dd', 'dth', 'user', 'users', 'week', 'monday', 'tuesday',
+  'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'and', 'or', 'for',
+  'of', 'the',
+};
+
+/// Meaningful words in a channel name. Single characters are dropped, so
+/// numbered feeds ("Star Sports 1") are compared by [_epgDigits] instead.
+Set<String> epgTokens(String value) => value
+    .toLowerCase()
+    .split(RegExp(r'[^a-z0-9]+'))
+    .where((token) => token.length >= 2)
+    .toSet();
+
+/// Numbers inside a channel name, taken from the *raw* text because
+/// [epgNameKey] strips "1 HD" and similar suffixes whole.
+Set<String> _epgDigits(String value) => {
+      for (final match in RegExp(r'\d+').allMatches(value.toLowerCase()))
+        match.group(0)!,
+    };
+
+/// One guide `<channel>` element, with the name comparison prepared once so the
+/// per-playlist-channel scan is only set operations.
+class _GuideChannelEntry {
+  final String id;
+  final List<EpgProgram> programmes;
+  final List<String> squashedNames;
+  final Set<String> coreTokens;
+
+  /// [coreTokens] with the guide's SEO filler removed, precomputed because the
+  /// lowest-confidence tier compares against it for every playlist channel.
+  final Set<String> coreWithoutFiller;
+
+  /// How many distinct words the guide used for this channel. The
+  /// lowest-confidence tier prefers the least decorated alias.
+  final int tokenCount;
+  final Set<String> digits;
+  final Set<String> languages;
+
+  const _GuideChannelEntry({
+    required this.id,
+    required this.programmes,
+    required this.squashedNames,
+    required this.coreTokens,
+    required this.coreWithoutFiller,
+    required this.tokenCount,
+    required this.digits,
+    required this.languages,
+  });
+
+  /// True when the two names name different variants of the brand. A conflict
+  /// only exists when both sides specify something and those specifications
+  /// share nothing; a playlist that omits the language is not a conflict.
+  bool conflictsWith(Set<String> otherDigits, Set<String> otherLanguages) {
+    if (digits.isNotEmpty &&
+        otherDigits.isNotEmpty &&
+        digits.intersection(otherDigits).isEmpty) {
+      return true;
+    }
+    return languages.isNotEmpty &&
+        otherLanguages.isNotEmpty &&
+        languages.intersection(otherLanguages).isEmpty;
+  }
+}
+
+/// The playlist side of the same comparison, computed once per sweep.
+class _ChannelProfile {
+  final String squashed;
+  final Set<String> coreTokens;
+  final Set<String> digits;
+  final Set<String> languages;
+
+  const _ChannelProfile._({
+    required this.squashed,
+    required this.coreTokens,
+    required this.digits,
+    required this.languages,
+  });
+
+  factory _ChannelProfile.of(String name) {
+    final tokens = epgTokens(name);
+    return _ChannelProfile._(
+      squashed: epgNameKey(name),
+      coreTokens: tokens.difference(_epgNoiseTokens),
+      digits: _epgDigits(name),
+      languages: tokens.intersection(_epgLanguageTokens),
+    );
+  }
+}
+
+/// Normalised view of every guide channel that actually carries programme data.
+///
+/// Keyed by id and never by display-name: two different feeds normalise to the
+/// same name once "HD" is stripped, and the previous name-keyed index appended
+/// their schedules into one list, which is a direct way to show a different
+/// channel's programmes.
+Map<String, _GuideChannelEntry> _indexGuideChannels(
   String xml,
   Map<String, List<EpgProgram>> programmes,
 ) {
@@ -2572,77 +2803,158 @@ Map<String, List<EpgProgram>> _indexGuideByName(
     dotAll: true,
   );
 
-  final byName = <String, List<EpgProgram>>{};
+  final byId = <String, _GuideChannelEntry>{};
 
   for (final m in channelRegex.allMatches(xml)) {
     final id = (m.group(2) ?? '').trim();
     final body = m.group(3) ?? '';
     if (id.isEmpty || !programmes.containsKey(id)) continue;
 
-    final dm = displayRegex.firstMatch(body);
-    if (dm == null) continue;
+    // XMLTV allows several <display-name> aliases per channel and providers
+    // disagree on which is primary, so every alias is kept, not just the first.
+    final names = displayRegex
+        .allMatches(body)
+        .map((d) => decodeXmlText(_stripTags(d.group(1) ?? '')))
+        .where((name) => name.trim().isNotEmpty)
+        .toList();
+    if (names.isEmpty) continue;
 
-    final display = decodeXmlText(_stripTags(dm.group(1) ?? ''));
-    final key = epgNameKey(display);
-    if (key.isNotEmpty) {
-      (byName[key] ??= <EpgProgram>[]).addAll(programmes[id]!);
-    }
+    final tokens = names.expand(epgTokens).toSet();
+    final core = tokens.difference(_epgNoiseTokens);
+    byId[id] = _GuideChannelEntry(
+      id: id,
+      programmes: programmes[id]!,
+      squashedNames:
+          names.map(epgNameKey).where((key) => key.isNotEmpty).toList(),
+      coreTokens: core,
+      coreWithoutFiller: core.difference(_epgGuideFillerTokens),
+      tokenCount: names
+          .map((name) => epgTokens(name).length)
+          .reduce((a, b) => a < b ? a : b),
+      digits: _epgDigits(names.join(' ')),
+      languages: tokens.intersection(_epgLanguageTokens),
+    );
   }
 
-  return byName;
+  return byId;
 }
 
-List<EpgProgram>? _matchChannelProgrammes(
+/// Find the guide entry for one playlist channel, or null when nothing can be
+/// matched confidently.
+///
+/// The previous rules accepted a bare substring ("stargold" sits inside
+/// "stargoldselect"), which handed a channel the schedule of a sibling feed.
+/// Now a candidate must agree once non-distinguishing noise is removed, and
+/// number or language variants are refused outright.
+_GuideChannelEntry? _matchGuideChannel(
   _EpgChannelQuery channel,
-  Map<String, List<EpgProgram>> programmes,
-  Map<String, List<EpgProgram>> byName,
+  _ChannelProfile profile,
+  Map<String, _GuideChannelEntry> byId,
 ) {
-  List<EpgProgram>? matched;
-
-  // 1. Exact tvg-id match, then a case-insensitive retry.
   final id = channel.tvgId.trim();
   if (id.isNotEmpty) {
-    matched = programmes[id];
-    if (matched == null) {
-      for (final entry in programmes.entries) {
-        if (entry.key.toLowerCase() == id.toLowerCase()) {
-          matched = entry.value;
+    var entry = byId[id];
+    if (entry == null) {
+      final lower = id.toLowerCase();
+      for (final candidate in byId.values) {
+        if (candidate.id.toLowerCase() == lower) {
+          entry = candidate;
           break;
         }
       }
     }
+    // Trust the id only while the guide's own name does not contradict the
+    // playlist: public lists carry ids copied between sibling feeds, and a
+    // wrong id is worse than no id, so a conflict falls through to name matching.
+    if (entry != null &&
+        !entry.conflictsWith(profile.digits, profile.languages)) {
+      return entry;
+    }
   }
 
-  // 2. Exact normalised channel-name match.
-  final channelKey = epgNameKey(channel.name);
-  matched ??= byName[channelKey];
+  _GuideChannelEntry? best;
+  int bestScore = 0;
+  _GuideChannelEntry? loose;
+  int looseCount = 0;
+  _GuideChannelEntry? filler;
+  int fillerCount = 0;
 
-  // 3. Fuzzy normalised-name match for provider naming differences.
-  if (matched == null && channelKey.isNotEmpty) {
-    int bestScore = 0;
-    for (final entry in byName.entries) {
-      final epgKey = entry.key;
-      int score;
+  for (final entry in byId.values) {
+    if (entry.conflictsWith(profile.digits, profile.languages)) continue;
 
-      if (epgKey == channelKey) {
-        score = 100;
-      } else if (epgKey.contains(channelKey) || channelKey.contains(epgKey)) {
-        score = 80;
-      } else {
-        final overlap =
-            epgTokens(channelKey).intersection(epgTokens(epgKey)).length;
-        score = overlap >= 2 ? 50 + overlap : 0;
-      }
+    final int score;
+    if (profile.coreTokens.isNotEmpty &&
+        profile.squashed.isNotEmpty &&
+        entry.squashedNames.contains(profile.squashed)) {
+      // Same trimmed name. [epgNameKey] deletes "india" and "tv" outright, so a
+      // name made only of those words ("&TV HD") trims to nothing meaningful and
+      // would otherwise be handed whatever channel the guide happens to call
+      // India TV; requiring a real word here is what keeps that from happening.
+      score = 100;
+    } else if (profile.coreTokens.isNotEmpty &&
+        entry.coreTokens.length == profile.coreTokens.length &&
+        entry.coreTokens.intersection(profile.coreTokens).length ==
+            entry.coreTokens.length) {
+      // Same meaningful words, different order or punctuation ("Zee TV" and
+      // "Zee TV HD", or a name written backwards by one provider).
+      score = 90;
+    } else if (profile.coreTokens.length >= 2 &&
+        profile.languages.isEmpty &&
+        entry.coreTokens.containsAll(profile.coreTokens) &&
+        _epgLanguageTokens.containsAll(
+            entry.coreTokens.difference(profile.coreTokens))) {
+      // The playlist names the feed loosely and the guide adds the language it
+      // is actually broadcast in: "Star Sports 2" matching "Star Sports 2 Hindi".
+      // Only a language may be missing, so "Sony" never claims "Sony Max".
+      // A single-word brand is excluded: "Sony" alone does not say which of the
+      // Sony feeds it means, and guessing here is the original bug.
+      score = 80;
+    } else if (profile.coreTokens.isNotEmpty &&
+        entry.coreWithoutFiller.length == profile.coreTokens.length &&
+        entry.coreWithoutFiller.containsAll(profile.coreTokens) &&
+        _epgSameDigits(entry.digits, profile.digits)) {
+      // The guide added only SEO filler to the same name, and says nothing
+      // about a numbered feed the playlist did not name.
+      score = 70;
+    } else {
+      score = 0;
+    }
 
+    if (score >= 90) {
       if (score > bestScore) {
         bestScore = score;
-        matched = entry.value;
+        best = entry;
+      }
+    } else if (score == 80) {
+      // Count every language feed this loose name could mean. "Nick" fitting
+      // both Nick Telugu and Nick Hindi is a coin flip, and a coin flip is how
+      // a channel came to show another channel's schedule.
+      looseCount++;
+      loose ??= entry;
+    } else if (score == 70) {
+      // Several aliases can collapse to the same meaningful name ("Sony Max Tv
+      // Channel Today" and "Sony Max Hd Tv Channel Today"). Prefer the least
+      // decorated one, and refuse when two are equally plain.
+      if (filler == null || entry.tokenCount < filler.tokenCount) {
+        filler = entry;
+        fillerCount = 1;
+      } else if (entry.tokenCount == filler.tokenCount) {
+        fillerCount++;
       }
     }
   }
 
-  return matched;
+  if (best != null) return best;
+  if (looseCount == 1) return loose;
+  return fillerCount == 1 ? filler : null;
 }
+
+/// True when both names number their feeds the same way. A playlist that says
+/// "Sony Max" must not be handed "Sony Max 2", whose schedule is different,
+/// even though every word of the shorter name appears in the longer one.
+bool _epgSameDigits(Set<String> guide, Set<String> playlist) =>
+    guide.length == playlist.length && guide.containsAll(playlist);
+
 
 EpgData buildEpgData(List<EpgProgram> source) {
   if (source.isEmpty) return const EpgData();
@@ -2669,39 +2981,23 @@ EpgData buildEpgData(List<EpgProgram> source) {
   );
 }
 
-bool hasUsefulEpgData(EpgData data) =>
-    data.now != null || data.next != null || data.upcoming.isNotEmpty;
-
-EpgProgram? mergeEpgProgram(EpgProgram? preferred, EpgProgram? fallback) {
-  if (preferred == null) return fallback;
-  if (fallback == null) return preferred;
-  return EpgProgram(
-    start: preferred.start,
-    stop: preferred.stop,
-    title: preferred.title,
-    description: preferred.description.isNotEmpty
-        ? preferred.description
-        : fallback.description,
-    imageUrl: preferred.imageUrl?.isNotEmpty == true
-        ? preferred.imageUrl
-        : fallback.imageUrl,
-  );
-}
-
-EpgData mergeEpgData(EpgData oldData, EpgData newData) {
-  final allUpcoming = <String, EpgProgram>{
-    for (final p in [...oldData.upcoming, ...newData.upcoming])
-      '${p.start.millisecondsSinceEpoch}|${p.stop.millisecondsSinceEpoch}|${p.title}': p,
-  };
-
-  final upcoming = allUpcoming.values.toList()
-    ..sort((a, b) => a.start.compareTo(b.start));
-
-  return EpgData(
-    now: mergeEpgProgram(newData.now, oldData.now),
-    next: mergeEpgProgram(newData.next, oldData.next),
-    upcoming: upcoming.take(6).toList(),
-  );
+/// Combine the programme lists one channel picked up from two guide sources.
+/// The first source wins for a given slot, so the playlist's own EPG URL takes
+/// precedence over the bulk Indian guides.
+List<EpgProgram> mergeEpgProgrammes(
+  List<EpgProgram> existing,
+  List<EpgProgram> added,
+) {
+  final bySlot = <String, EpgProgram>{};
+  for (final program in [...existing, ...added]) {
+    bySlot.putIfAbsent(
+      '${program.start.millisecondsSinceEpoch}'
+      '|${program.stop.millisecondsSinceEpoch}'
+      '|${program.title}',
+      () => program,
+    );
+  }
+  return bySlot.values.toList()..sort((a, b) => a.start.compareTo(b.start));
 }
 
 /// Normalises provider/channel naming differences so the same channel still
@@ -2717,18 +3013,6 @@ String epgNameKey(String value) {
   v = v.replaceAll(RegExp(r'\s+'), ' ').trim();
 
   return v.replaceAll(RegExp(r'[^a-z0-9]+'), '');
-}
-
-Set<String> epgTokens(String value) {
-  const ignored = {
-    'tv', 'television', 'channel', 'india', 'hd', 'sd',
-    'english', 'hindi', 'live', 'network',
-  };
-
-  return value
-      .split(RegExp(r'[^a-z0-9]+'))
-      .where((e) => e.length >= 2 && !ignored.contains(e))
-      .toSet();
 }
 
 DateTime? parseXmltvDate(String? raw) {
