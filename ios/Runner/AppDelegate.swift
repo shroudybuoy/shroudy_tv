@@ -135,7 +135,13 @@ final class PictureInPictureBridge: NSObject, FlutterPlugin, FlutterStreamHandle
     // Underneath Flutter's own view: added on top it would cover the app.
     window.layer.insertSublayer(layer, at: 0)
 
-    let pip = AVPictureInPictureController(playerLayer: layer)
+    // The initializer is failable: it returns nil when the device does not
+    // support PiP at all.
+    guard let pip = AVPictureInPictureController(playerLayer: layer) else {
+      layer.removeFromSuperlayer()
+      emit(["state": "no_pip_controller", "url": target.absoluteString])
+      return
+    }
     pip.delegate = self
     if #available(iOS 15.0, *) {
       // This is what turns "pressed the home button" into a PiP window without the app
@@ -205,7 +211,7 @@ final class PictureInPictureBridge: NSObject, FlutterPlugin, FlutterStreamHandle
       // NSError that is only visible from here.
       "itemStatus": player?.currentItem?.status.rawValue ?? -1,
       "error": player?.currentItem?.error?.localizedDescription ?? "",
-      "canStart": controller?.canStartPictureInPicture ?? false,
+      "canStart": controller?.isPictureInPicturePossible ?? false,
       "active": controller?.isPictureInPictureActive ?? false,
     ]
   }
@@ -250,7 +256,9 @@ final class PictureInPictureBridge: NSObject, FlutterPlugin, FlutterStreamHandle
 
   // MARK: - AVPictureInPictureControllerDelegate
 
-  func pictureInPictureControllerWillStartPictureInPicture(
+  // These are optional requirements of an Objective-C protocol, so they are
+  // marked @objc explicitly rather than left to inference.
+  @objc func pictureInPictureControllerWillStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     // The app is on its way out and Dart pauses VLC when it hears PiP started, so
@@ -262,13 +270,19 @@ final class PictureInPictureBridge: NSObject, FlutterPlugin, FlutterStreamHandle
     emit(statusPayload())
   }
 
-  func pictureInPictureControllerDidStartPictureInPicture(
+  @objc func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     emit(statusPayload())
   }
 
-  func pictureInPictureControllerDidStopPictureInPicture(
+  @objc func pictureInPictureControllerWillStopPictureInPicture(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) {
+    emit(statusPayload())
+  }
+
+  @objc func pictureInPictureControllerDidStopPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     // Back in the app: VLC is audible again, so go quiet but keep buffering, which is
@@ -276,12 +290,6 @@ final class PictureInPictureBridge: NSObject, FlutterPlugin, FlutterStreamHandle
     player?.isMuted = true
     player?.volume = 0
     player?.play()
-    emit(statusPayload())
-  }
-
-  func pictureInPictureControllerWillRestoreUserInterface(
-    _ pictureInPictureController: AVPictureInPictureController
-  ) {
     emit(statusPayload())
   }
 }
